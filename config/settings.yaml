@@ -1,0 +1,27 @@
+# Phase 0 — core settings & feature flags
+app:
+  name: "krishna-trade-worker"
+  timezone_primary: "UTC"
+  timezone_secondary: "Asia/Kolkata"   # IST display
+  heartbeat_sec: 15
+  lease_ttl_sec: 45
+
+feature_flags:
+  weekend_backtest_only: true
+  budget_guard_enabled: true
+  ntp_check_enabled: true
+
+budget:
+  openai_budget_usd: 23.0        # cap (user pref)
+  hard_stop: true                # true => block when cap hit
+  state_path: "data/budget_state.json"
+
+ntp:
+  servers:
+    - "time.google.com"
+    - "pool.ntp.org"
+  max_skew_seconds: 2.0          # alert if abs(skew) > 2s
+  timeout_sec: 3.0
+
+logging:
+  level: "INFO"
