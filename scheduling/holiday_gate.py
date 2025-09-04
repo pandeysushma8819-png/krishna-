@@ -1,8 +1,7 @@
-# scheduling/holiday_gate.py — holiday halt using config/calendars.yaml
 from __future__ import annotations
 from datetime import datetime
 from zoneinfo import ZoneInfo
-import yaml, os
+import yaml
 
 IST = ZoneInfo("Asia/Kolkata")
 
