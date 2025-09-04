@@ -1,7 +1,5 @@
-# scheduling/jobs.py — background loops to enforce policy + weekly digest
 from __future__ import annotations
 import asyncio, os, json
-from datetime import datetime, timedelta, timezone
 from policy.state import POLICY
 from scheduling.weekend_gate import is_weekend_ist
 from scheduling.holiday_gate import holiday_reason, _load_calendars
@@ -14,16 +12,15 @@ _sheets = SheetsClient()
 
 async def policy_watchdog():
     """
-    Periodically evaluate weekend/holiday/freeze and emit events on change.
+    Periodically evaluate weekend/holiday/freeze and emit events when state changes.
     """
     cfg_cal = _load_calendars()
     cfg_pol = _load_policy()
     markets = os.getenv("MARKETS", "NSE,BANKNIFTY,FINNIFTY,BTCUSD")
-    last = POLICY.snapshot()
 
     while True:
         try:
-            # Weekend
+            # Weekend (IST)
             wk_on = is_weekend_ist()
             if POLICY.set_weekend(wk_on):
                 if wk_on:
@@ -33,7 +30,7 @@ async def policy_watchdog():
                     _sheets.log_event("policy_weekend_off", "Weekday IST", "sched")
                     METRICS.bump("policy_weekend_off")
 
-            # Holiday
+            # Holiday by calendars
             h_on, h_reason = holiday_reason(markets, cfg=cfg_cal)
             if POLICY.set_holiday(h_on, h_reason):
                 if h_on:
@@ -43,7 +40,7 @@ async def policy_watchdog():
                     _sheets.log_event("holiday_halt_off", "", "sched")
                     METRICS.bump("holiday_halt_off")
 
-            # News freeze
+            # News freeze windows
             f_on, f_tag = active_freeze(cfg=cfg_pol)
             if POLICY.set_freeze(f_on, f_tag):
                 if f_on:
@@ -56,12 +53,11 @@ async def policy_watchdog():
         except Exception:
             METRICS.bump("errors_total")
 
-        # check every 20s
-        await asyncio.sleep(20)
+        await asyncio.sleep(20)  # watchdog tick
 
 async def weekly_digest():
     """
-    Once a week (per policy.yaml), log a digest snapshot.
+    Once per week (policy.yaml), log a metrics snapshot to Events.
     """
     while True:
         try:
@@ -74,7 +70,7 @@ async def weekly_digest():
             _sheets.log_event("weekly_digest", json.dumps(snap), "sched")
         except Exception:
             METRICS.bump("errors_total")
-            await asyncio.sleep(60)  # backoff then recompute
+            await asyncio.sleep(60)  # backoff then retry
 
 async def start_background():
     # Run both loops concurrently
