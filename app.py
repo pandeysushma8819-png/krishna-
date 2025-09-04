@@ -1,4 +1,4 @@
-# app.py — P2 server: /tv_alert + /healthz + schedulers
+# app.py — P3 server: adds lease loop and lease info in health
 from __future__ import annotations
 import os, yaml, asyncio
 from starlette.applications import Starlette
@@ -10,13 +10,15 @@ from utils.metrics import METRICS, snapshot_metrics
 from routes.tv import tv_alert
 from policy.state import POLICY
 from scheduling.jobs import start_background
+from scheduling.lease_runner import lease_loop
+from utils.lease_status import LEASE
 
 def load_settings(path: str = "config/settings.yaml") -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 async def root(request):
-    return JSONResponse({"ok": True, "msg": "KTW P2 running. Endpoints: /tv_alert (POST), /healthz (GET)"})
+    return JSONResponse({"ok": True, "msg": "KTW P3 running. Endpoints: /tv_alert (POST), /healthz (GET)"})
 
 async def healthz(request):
     cfg = load_settings()
@@ -24,6 +26,7 @@ async def healthz(request):
     guard = BudgetGuard(cap, cfg["budget"]["hard_stop"], cfg["budget"]["state_path"])
     metrics = snapshot_metrics()
     policy = POLICY.snapshot()
+    lease = LEASE.snapshot()
     return JSONResponse({
         "status": "ok",
         "app": cfg["app"]["name"],
@@ -35,6 +38,7 @@ async def healthz(request):
         "flags": cfg.get("feature_flags", {}),
         "metrics": metrics,
         "policy": policy,
+        "lease": lease,
     })
 
 routes = [
@@ -45,13 +49,13 @@ routes = [
 
 app = Starlette(debug=False, routes=routes)
 
-# kick off background tasks on startup
 @app.on_event("startup")
 async def _startup():
-    app.state.bg_task = asyncio.create_task(start_background())
+    app.state.bg_policy = asyncio.create_task(start_background())
+    app.state.bg_lease  = asyncio.create_task(lease_loop())
 
 @app.on_event("shutdown")
 async def _shutdown():
-    t = getattr(app.state, "bg_task", None)
-    if t:
-        t.cancel()
+    for name in ("bg_policy","bg_lease"):
+        t = getattr(app.state, name, None)
+        if t: t.cancel()
