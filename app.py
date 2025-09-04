@@ -1,9 +1,9 @@
-# app.py — P3 server: adds lease loop and lease info in health
 from __future__ import annotations
 import os, yaml, asyncio
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse
 from starlette.routing import Route
+
 from utils.time_utils import now_utc, now_ist, fmt
 from utils.budget_guard import BudgetGuard
 from utils.metrics import METRICS, snapshot_metrics
@@ -51,11 +51,14 @@ app = Starlette(debug=False, routes=routes)
 
 @app.on_event("startup")
 async def _startup():
+    # Background tasks: policy watchdogs + lease maintenance
     app.state.bg_policy = asyncio.create_task(start_background())
     app.state.bg_lease  = asyncio.create_task(lease_loop())
 
 @app.on_event("shutdown")
 async def _shutdown():
-    for name in ("bg_policy","bg_lease"):
+    # Cancel background tasks cleanly
+    for name in ("bg_policy", "bg_lease"):
         t = getattr(app.state, name, None)
-        if t: t.cancel()
+        if t:
+            t.cancel()
