@@ -1,4 +1,3 @@
-# scheduling/lease_runner.py — acquire/refresh lease + optional render pause/resume
 from __future__ import annotations
 import asyncio, time, os
 from utils.lease_status import LEASE
@@ -39,8 +38,9 @@ async def _try_acquire_or_refresh():
             METRICS.bump("lease_active")
             return True
         else:
-            # Can't write -> act passive for safety
-            LEASE.set(lease_owner=owner, heartbeat_ts=hb, lease_ttl_sec=ttl, host_id=_MY_ID, host_kind=_KIND, mode="passive")
+            # Can't write -> be passive for safety
+            LEASE.set(lease_owner=owner, heartbeat_ts=hb, lease_ttl_sec=ttl,
+                      host_id=_MY_ID, host_kind=_KIND, mode="passive")
             METRICS.bump("sheet_errors")
             return False
     else:
@@ -57,25 +57,21 @@ async def _try_acquire_or_refresh():
         return owner == _MY_ID
 
 async def lease_loop():
-    """Main loop: maintain lease + render handover hooks."""
-    # On startup, attempt to acquire quickly
+    """Maintain single active host and call optional Render pause/resume hooks."""
     await _try_acquire_or_refresh()
-
     was_active = False
+
     while True:
         active = await _try_acquire_or_refresh()
 
-        # Handover hooks
+        # Optional cost-save hooks
         try:
             if active and not was_active and _KIND == "local":
-                # Local just became active → pause Render (optional)
-                await pause_render_if_enabled()
-            if not active and was_active and _KIND == "render":
-                # Render lost active status → (optional) pause self or no-op
-                await pause_render_if_enabled()
+                await pause_render_if_enabled()     # local became active → pause Render
             if not active and was_active and _KIND == "local":
-                # Local lost lease → resume Render (optional)
-                await resume_render_if_enabled()
+                await resume_render_if_enabled()    # local lost lease → resume Render
+            if not active and was_active and _KIND == "render":
+                await pause_render_if_enabled()     # render lost active → may pause self (optional)
         except Exception:
             METRICS.bump("errors_total")
 
