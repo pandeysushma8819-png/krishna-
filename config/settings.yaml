@@ -10,7 +10,7 @@ feature_flags:
   weekend_backtest_only: true
   budget_guard_enabled: true
   ntp_check_enabled: true
-  hmac_required: true           # if header missing & false => allow secret-in-body fallback
+  hmac_required: false          # if header missing & false => allow secret-in-body fallback
 
 budget:
   openai_budget_usd: 23.0
