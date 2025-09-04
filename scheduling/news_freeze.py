@@ -1,6 +1,6 @@
 # scheduling/news_freeze.py — time-window freezes from config/policy.yaml
 from __future__ import annotations
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import yaml
 
@@ -30,16 +30,16 @@ def active_freeze(now_utc: datetime | None = None, cfg: dict | None = None) -> t
 
 def next_weekly_digest_utc(cfg: dict | None = None) -> datetime:
     cfg = cfg or _load_policy()
-    tz = ZoneInfo( (cfg.get("weekly_digest") or {}).get("tz") or "Asia/Kolkata" )
-    weekday = int( (cfg.get("weekly_digest") or {}).get("weekday") or 6 )
-    hour = int( (cfg.get("weekly_digest") or {}).get("hour") or 18 )
-    minute = int( (cfg.get("weekly_digest") or {}).get("minute") or 0 )
+    wd = cfg.get("weekly_digest") or {}
+    tz = ZoneInfo(wd.get("tz") or "Asia/Kolkata")
+    weekday = int(wd.get("weekday", 6))   # 0=Mon ... 6=Sun
+    hour = int(wd.get("hour", 18))
+    minute = int(wd.get("minute", 0))
 
     now = datetime.now(tz)
-    # find next desired weekday/hour/minute
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
     days_ahead = (weekday - now.weekday()) % 7
-    candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if days_ahead == 0 and candidate <= now:
+    if days_ahead == 0 and target <= now:
         days_ahead = 7
-    target_local = (candidate if days_ahead == 0 else (candidate + timedelta(days=days_ahead)))
+    target_local = target + timedelta(days=days_ahead)
     return target_local.astimezone(ZoneInfo("UTC"))
