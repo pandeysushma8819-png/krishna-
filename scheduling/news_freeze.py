@@ -1,4 +1,3 @@
-# scheduling/news_freeze.py — time-window freezes from config/policy.yaml
 from __future__ import annotations
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -9,7 +8,7 @@ def _load_policy(path: str = "config/policy.yaml") -> dict:
         return yaml.safe_load(f) or {}
 
 def _to_utc(dt_str: str, tz_name: str) -> datetime:
-    # dt_str: "YYYY-MM-DD HH:MM"
+    # dt_str format: "YYYY-MM-DD HH:MM"
     local = datetime.strptime(dt_str, "%Y-%m-%d %H:%M")
     z = ZoneInfo(tz_name)
     return local.replace(tzinfo=z).astimezone(ZoneInfo("UTC"))
