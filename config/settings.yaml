@@ -2,7 +2,7 @@
 app:
   name: "krishna-trade-worker"
   timezone_primary: "UTC"
-  timezone_secondary: "Asia/Kolkata"   # IST display
+  timezone_secondary: "Asia/Kolkata"
   heartbeat_sec: 15
   lease_ttl_sec: 45
 
@@ -10,18 +10,28 @@ feature_flags:
   weekend_backtest_only: true
   budget_guard_enabled: true
   ntp_check_enabled: true
+  hmac_required: true           # if header missing & false => allow secret-in-body fallback
 
 budget:
-  openai_budget_usd: 23.0        # cap (user pref)
-  hard_stop: true                # true => block when cap hit
+  openai_budget_usd: 23.0
+  hard_stop: true
   state_path: "data/budget_state.json"
 
 ntp:
   servers:
     - "time.google.com"
     - "pool.ntp.org"
-  max_skew_seconds: 2.0          # alert if abs(skew) > 2s
+  max_skew_seconds: 2.0
   timeout_sec: 3.0
 
 logging:
   level: "INFO"
+
+intake:
+  rate_limit_per_sec: 10        # global cap
+  jitter_ms_min: 40
+  jitter_ms_max: 140
+  signature_headers:            # tried in order
+    - "X-TV-Signature"
+    - "X-Tv-Signature"
+    - "X-Webhook-Signature"
