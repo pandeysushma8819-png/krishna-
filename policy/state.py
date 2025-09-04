@@ -1,4 +1,3 @@
-# policy/state.py — global policy flags + snapshot
 from __future__ import annotations
 import threading, time
 from dataclasses import dataclass, asdict
