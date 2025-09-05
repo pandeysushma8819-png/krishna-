@@ -8,6 +8,9 @@ SIGNALS_HDR = ["ts","symbol","tf","id","hash","status","recv_at_utc","latency_ms
 EVENTS_HDR  = ["ts","type","detail","who"]
 STATUS_HDR  = ["lease_owner","heartbeat_ts","lease_ttl_sec","host_id","host_kind","mode","updated_ts"]
 
+SNAPSHOTS_HDR   = ["ts","strategy_id","version","seed","window","spec_json","metrics_json","tag"]
+LEADERBOARD_HDR = ["ts","strategy_id","version","ret_pct","mdd_pct","pf","win_rate_pct","trades","score","status"]
+
 class SheetsClient:
     """
     Resilient Google Sheets client with simple diagnostics.
@@ -17,7 +20,7 @@ class SheetsClient:
         self.enabled = bool(os.getenv("GSHEET_SPREADSHEET_ID")) and bool(os.getenv("GOOGLE_SA_JSON"))
         self._gc = None
         self._ss = None
-        self._ws_cache: dict[str, gspread.Worksheet] = {}
+        self._ws_cache = {}
         self._last_error: str = ""
         self._client_email: str = ""
         self._sheet_id: str = os.getenv("GSHEET_SPREADSHEET_ID","")
@@ -52,7 +55,7 @@ class SheetsClient:
             except gspread.exceptions.WorksheetNotFound:
                 ws = self._ss.add_worksheet(title=name, rows=2000, cols=max(10, len(header)))
                 ws.append_row(header)
-            # ensure header row
+            # ensure header row exact
             try:
                 first = ws.row_values(1)
                 if [h.strip() for h in first] != header:
@@ -76,7 +79,7 @@ class SheetsClient:
             "last_error": self._last_error,
         }
 
-    # ---------- public APIs ----------
+    # ---------- Signals / Events ----------
     def append_signal(self, symbol: str, tf: str, sid: str, ihash: str, status: str, raw: dict, rtt_ms: int) -> bool:
         if not self.enabled:
             self._last_error = "disabled"
@@ -150,4 +153,67 @@ class SheetsClient:
             return True
         except Exception as e:
             self._last_error = f"write_status: {e}"
+            return False
+
+    # ---------- P6: Snapshots & Leaderboard ----------
+    def snapshot_spec(self, spec_obj, metrics: dict, tag: str = "") -> bool:
+        """
+        Archive a spec + metrics JSON (append-only).
+        """
+        if not self.enabled:
+            self._last_error = "disabled"
+            return False
+        ws = self._get_ws("Snapshots", SNAPSHOTS_HDR)
+        if not ws:
+            return False
+        try:
+            from strategies.spec import StrategySpec
+            if isinstance(spec_obj, StrategySpec):
+                spec_json = spec_obj.to_json()
+                sid = spec_obj.strategy_id
+                ver = spec_obj.version
+                seed = spec_obj.seed
+                window = spec_obj.window
+            else:
+                spec_json = json.dumps(spec_obj, separators=(",",":"))
+                sid = ""
+                ver = ""
+                seed = 0
+                window = ""
+            row = [int(time.time()), sid, ver, seed, window, spec_json, json.dumps(metrics, separators=(",",":")), tag]
+            ws.append_row(row, value_input_option="RAW")
+            return True
+        except Exception as e:
+            self._last_error = f"snapshot_spec: {e}"
+            return False
+
+    def append_leaderboard(self, row: dict) -> bool:
+        """
+        Append a leaderboard row. Minimal upsert: append latest; downstream views can filter by max(ts).
+        """
+        if not self.enabled:
+            self._last_error = "disabled"
+            return False
+        ws = self._get_ws("Leaderboard", LEADERBOARD_HDR)
+        if not ws:
+            return False
+        try:
+            ts = int(time.time())
+            stats = row.get("stats", {})
+            payload = [
+                ts,
+                row.get("strategy_id",""),
+                row.get("version",""),
+                float(stats.get("ret_pct",0.0)),
+                float(stats.get("mdd_pct",0.0)),
+                float(stats.get("profit_factor",0.0)),
+                float(stats.get("win_rate_pct",0.0)),
+                int(stats.get("trades",0)),
+                float(row.get("score",0.0)),
+                "candidate"
+            ]
+            ws.append_row(payload, value_input_option="RAW")
+            return True
+        except Exception as e:
+            self._last_error = f"append_leaderboard: {e}"
             return False
