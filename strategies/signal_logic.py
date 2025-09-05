@@ -4,10 +4,6 @@ from strategies.spec import StrategySpec
 from strategies.indicators import ema, rsi
 
 def build_target_positions(bars: List[dict], spec: StrategySpec) -> Dict[int, int]:
-    """
-    Returns {ts: -1|0|1}. No look-ahead: uses only past data to set today's target,
-    execution happens on next bar in backtester.
-    """
     sid = spec.strategy_id.lower()
     if sid == "ema_cross":
         fast = int(spec.params.get("fast", 10))
@@ -21,7 +17,6 @@ def build_target_positions(bars: List[dict], spec: StrategySpec) -> Dict[int, in
             if i == 0:
                 out[int(b["ts"])] = 0
                 continue
-            # cross with yesterday’s EMAs (avoid look-ahead)
             if e_fast[i-1] > e_slow[i-1] and last_pos <= 0:
                 last_pos = 1
             elif e_fast[i-1] < e_slow[i-1] and last_pos >= 0:
@@ -45,5 +40,4 @@ def build_target_positions(bars: List[dict], spec: StrategySpec) -> Dict[int, in
             out[int(b["ts"])] = pos
         return out
 
-    # default: flat
     return {int(b["ts"]): 0 for b in bars}
