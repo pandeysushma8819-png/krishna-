@@ -1,0 +1,25 @@
+markets:
+  NIFTY:
+    lot_size: 50
+    tz: "Asia/Kolkata"
+    session:
+      start: "09:15"
+      end: "15:30"
+  BANKNIFTY:
+    lot_size: 15
+    tz: "Asia/Kolkata"
+    session:
+      start: "09:15"
+      end: "15:30"
+  FINNIFTY:
+    lot_size: 40
+    tz: "Asia/Kolkata"
+    session:
+      start: "09:15"
+      end: "15:30"
+  NSE_EQ:
+    lot_size: 1
+    tz: "Asia/Kolkata"
+    session:
+      start: "09:15"
+      end: "15:30"
