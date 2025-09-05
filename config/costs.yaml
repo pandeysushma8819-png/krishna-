@@ -1,0 +1,52 @@
+# Phase 5 — Trading costs (approx; verify with your broker)
+plans:
+  INDIA_DISCOUNT:                # Zerodha-like ballpark (illustrative)
+    equity_delivery:
+      brokerage_pct: 0.0         # Delivery usually 0
+      brokerage_cap: 0.0
+      stt_pct_buy: 0.0010        # 0.10% buy
+      stt_pct_sell: 0.0010       # 0.10% sell
+      exch_txn_pct: 0.0000345    # 0.00345%
+      sebi_pct: 0.000001         # ₹10 per crore
+      stamp_pct_buy: 0.00015     # 0.015% buy
+      gst_pct_on: ["brokerage","exch_txn"]  # 18% on these two only
+      gst_pct: 0.18
+      min_brokerage: 0.0
+    equity_intraday:
+      brokerage_pct: 0.0003      # 0.03% each leg, cap ~₹20
+      brokerage_cap: 20.0
+      stt_pct_buy: 0.0
+      stt_pct_sell: 0.00025      # 0.025% sell
+      exch_txn_pct: 0.0000345
+      sebi_pct: 0.000001
+      stamp_pct_buy: 0.00003     # 0.003% buy
+      gst_pct_on: ["brokerage","exch_txn"]
+      gst_pct: 0.18
+      min_brokerage: 0.0
+    futures:
+      brokerage_pct: 0.0         # Often flat ₹20 per order
+      brokerage_cap: 20.0
+      stt_pct_buy: 0.0
+      stt_pct_sell: 0.000125     # 0.0125% sell
+      exch_txn_pct: 0.000019     # 0.0019%
+      sebi_pct: 0.000001
+      stamp_pct_buy: 0.00002     # 0.002% buy (notional)
+      gst_pct_on: ["brokerage","exch_txn"]
+      gst_pct: 0.18
+      min_brokerage: 0.0
+    options:
+      brokerage_pct: 0.0
+      brokerage_cap: 20.0        # flat per order
+      stt_pct_buy: 0.0
+      stt_pct_sell: 0.000625     # 0.0625% on premium (sell)
+      exch_txn_pct: 0.0005       # 0.05% of premium
+      sebi_pct: 0.000001
+      stamp_pct_buy: 0.00003     # 0.003% of premium
+      gst_pct_on: ["brokerage","exch_txn"]
+      gst_pct: 0.18
+      min_brokerage: 0.0
+
+defaults:
+  plan: INDIA_DISCOUNT
+  product: equity_intraday       # equity_delivery | equity_intraday | futures | options
+  lot_size: 1
