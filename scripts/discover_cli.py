@@ -36,7 +36,8 @@ def main():
     with open(args.out, "w") as f:
         json.dump(res, f, indent=2)
 
-    print(f"OK: wrote {args.out}. Leader: {res.get('leader') and res['leader']['strategy_id']} {res.get('leader') and res['leader']['version']}")
+    leader = res.get('leader')
+    print(f"OK: wrote {args.out}. Leader: {leader and (leader['strategy_id']+' '+leader['version'])}")
 
 if __name__ == "__main__":
     main()
