@@ -12,7 +12,7 @@ from control.state import CONTROL
 from utils.ratelimit import TokenBucket
 
 # per-user rate limit (tokens/min)
-_BUCKET = None
+_BUCKET: TokenBucket | None = None  # <-- FIX: correct var name
 
 def _cfg():
     with open("config/settings.yaml","r",encoding="utf-8") as f:
@@ -42,11 +42,11 @@ async def _send(chat_id: int, text: str) -> None:
             pass
 
 def _bucket() -> TokenBucket:
-    global __BUCKET
-    if __BUCKET is None:
+    global _BUCKET
+    if _BUCKET is None:
         rate = int(_cfg().get("telegram",{}).get("rate_limit_per_min", 20))
-        __BUCKET = TokenBucket(capacity=rate, refill_secs=60.0)
-    return __BUCKET
+        _BUCKET = TokenBucket(capacity=rate, refill_secs=60.0)
+    return _BUCKET
 
 async def telegram_webhook(request: Request):
     # path param: secret
@@ -84,7 +84,6 @@ async def telegram_webhook(request: Request):
 
     METRICS.bump("tg_cmds_total")
 
-    # Commands
     t = text.lower()
 
     if t in ("/start","/help"):
@@ -121,7 +120,7 @@ async def telegram_webhook(request: Request):
         return JSONResponse({"ok": True})
 
     if t.startswith("/panic_flat"):
-        changed = CONTROL.set_panic(True, who="tg")
+        CONTROL.set_panic(True, who="tg")
         await _send(chat_id, "🆘 PANIC ON — new entries will be blocked")
         return JSONResponse({"ok": True})
 
