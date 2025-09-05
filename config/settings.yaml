@@ -35,3 +35,6 @@ intake:
     - "X-TV-Signature"
     - "X-Tv-Signature"
     - "X-Webhook-Signature"
+telegram:
+  rate_limit_per_min: 20     # per-user command limit
+  webhook_secret: "tg-hook"  # URL path segment; override via env TELEGRAM_WEBHOOK_SECRET
