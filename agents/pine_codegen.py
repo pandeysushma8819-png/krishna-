@@ -1,73 +1,85 @@
+mkdir -p agents
+cat > agents/pine_codegen.py <<'PY'
 from __future__ import annotations
 import json
 from typing import Dict, Any
 
-def _pine_header(name: str, initial_capital: float = 1_000_000.0) -> str:
+def _pine_header(name: str,
+                 initial_capital: float = 1_000_000.0,
+                 default_qty_value: float = 1.0,
+                 commission_percent: float = 0.03,
+                 slippage_ticks: int = 0) -> str:
+    # IMPORTANT: all values below must be constants, not input.* calls
     return f"""//@version=5
 strategy("{name}",
      overlay=true,
-     initial_capital={initial_capital},
+     initial_capital={int(initial_capital)},
      default_qty_type=strategy.fixed,
-     default_qty_value=input.float(1.0, "Order size (shares/contracts)", minval=0.0),
+     default_qty_value={default_qty_value},
      commission_type=strategy.commission.percent,
-     commission_value=input.float(0.03, "Commission % per leg", step=0.001),
-     slippage=input.int(0, "Slippage (ticks)"),
+     commission_value={commission_percent},
+     slippage={int(slippage_ticks)},
      calc_on_every_tick=false,
      calc_on_order_fills=false,
      process_orders_on_close=true,
-     pyramiding=0)"""
+     pyramiding=0)
+"""
+
+def _inputs_block_qty() -> str:
+    return """// === Inputs (UI)
+// These do NOT wire into strategy() header (TV requires constants there).
+orderQty = input.float(1.0, "Order size (shares/contracts)", minval=0.0)
+"""
 
 def _pine_body_ema_cross(fast: int, slow: int) -> str:
-    return f"""
-// === Inputs
+    return f"""{_inputs_block_qty()}// EMA Cross parameters
 fastLen = input.int({fast}, "Fast EMA", minval=2)
 slowLen = input.int({slow}, "Slow EMA", minval=3)
-slowLen := math.max(slowLen, fastLen + 1)  // ensure slow > fast
+slowLen2 = math.max(slowLen, fastLen + 1)  // ensure slow > fast
 
-// === Series
+// Series
 emaFast = ta.ema(close, fastLen)
-emaSlow = ta.ema(close, slowLen)
+emaSlow = ta.ema(close, slowLen2)
 
-// === No look-ahead: base signals on previous bar state
+// No look-ahead: use prior bar state
 longSig = ta.crossover(emaFast[1], emaSlow[1])
 flatSig = ta.crossunder(emaFast[1], emaSlow[1])
 
-// === Execution: act only on confirmed bars
+// Execute on confirmed bars
 if barstate.isconfirmed
     if (longSig and strategy.position_size <= 0)
-        strategy.entry("L", strategy.long)
+        strategy.entry("L", strategy.long, qty=orderQty)
     if (flatSig and strategy.position_size > 0)
         strategy.close("L")
 
-// === Plots
+// Plots
 plot(emaFast, color=color.new(color.teal, 0), title="EMA Fast")
 plot(emaSlow, color=color.new(color.orange, 0), title="EMA Slow")
 plotshape(barstate.isconfirmed and longSig, title="Long", style=shape.triangleup, color=color.new(color.teal,0), location=location.belowbar, size=size.tiny, text="L")
 plotshape(barstate.isconfirmed and flatSig,  title="Flat", style=shape.triangledown, color=color.new(color.orange,0), location=location.abovebar, size=size.tiny, text="F")
 
-// === Notes
-// • Signals are computed from [1] (prior bar) and executed on the current confirmed bar.
-// • With process_orders_on_close=true, fills occur on the bar's close (TradingView model).
-// • Your live engine fills on the next bar; treat this script as a sanity backtest.
+// Notes:
+// • strategy() header uses constants only (TV limitation).
+// • Signals from [1] bar → avoids look-ahead.
+// • With process_orders_on_close=true, fills are same-bar close (live engine uses next bar).
 """
 
 def _pine_body_rsi_reversion(period: int, buy_th: float, sell_th: float) -> str:
-    return f"""
-// === Inputs
+    return f"""{_inputs_block_qty()}// RSI Reversion parameters
 rsiLen  = input.int({period}, "RSI Length",  minval=2)
 buyTh   = input.float({buy_th}, "Buy RSI ≤",  step=0.1)
 sellTh  = input.float({sell_th}, "Sell RSI ≥", step=0.1)
 
-// === Series
+// Series
 r = ta.rsi(close, rsiLen)
 
-// === No look-ahead: use prior bar RSI
+// No look-ahead
 goLong = r[1] <= buyTh
 goFlat = r[1] >= sellTh
 
 if barstate.isconfirmed
     if (goLong and strategy.position_size <= 0)
-        strategy.entry("L", strategy.long)
+        strategy.entry("L", strategy.long, qty=orderQty)
     if (goFlat and strategy.position_size > 0)
         strategy.close("L")
 
@@ -80,7 +92,11 @@ def generate_pine(spec: Dict[str, Any]) -> str:
     sid = spec["strategy_id"].lower()
     ver = spec.get("version", "v0")
     name = f"KTW — {sid.upper()} ({ver})"
-    header = _pine_header(name)
+    header = _pine_header(name,
+                          initial_capital=1_000_000,
+                          default_qty_value=1.0,
+                          commission_percent=0.03,
+                          slippage_ticks=0)
     if sid == "ema_cross":
         p = spec.get("params", {})
         fast = int(p.get("fast", 10))
@@ -104,7 +120,9 @@ if __name__ == "__main__":
     spec = json.load(open(args.spec_json))
     code = generate_pine(spec)
     if args.out:
+        pathlib.Path(args.out).parent.mkdir(parents=True, exist_ok=True)
         pathlib.Path(args.out).write_text(code, encoding="utf-8")
         print(f"OK: wrote {args.out}")
     else:
         sys.stdout.write(code)
+PY
