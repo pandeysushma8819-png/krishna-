@@ -8,18 +8,20 @@ from utils.time_utils import now_utc, now_ist, fmt
 from utils.budget_guard import BudgetGuard
 from utils.metrics import METRICS, snapshot_metrics
 from routes.tv import tv_alert
+from routes.telegram import telegram_webhook
 from policy.state import POLICY
 from scheduling.jobs import start_background
 from scheduling.lease_runner import lease_loop
 from utils.lease_status import LEASE
 from integrations.sheets import SheetsClient
+from control.state import CONTROL
 
 def load_settings(path: str = "config/settings.yaml") -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 async def root(request):
-    return JSONResponse({"ok": True, "msg": "KTW P3 running. Endpoints: /tv_alert (POST), /healthz (GET)"})
+    return JSONResponse({"ok": True, "msg": "KTW P4 running. Endpoints: /tv_alert (POST), /healthz (GET), /telegram/<secret> (POST)"})
 
 async def healthz(request):
     cfg = load_settings()
@@ -28,7 +30,8 @@ async def healthz(request):
     metrics = snapshot_metrics()
     policy = POLICY.snapshot()
     lease = LEASE.snapshot()
-    sheets = SheetsClient().status_summary()  # light-weight diag
+    sheets = SheetsClient().status_summary()
+    control = CONTROL.snapshot()
     return JSONResponse({
         "status": "ok",
         "app": cfg["app"]["name"],
@@ -42,12 +45,14 @@ async def healthz(request):
         "policy": policy,
         "lease": lease,
         "sheets": sheets,
+        "control": control,
     })
 
 routes = [
     Route("/", root),
     Route("/healthz", healthz),
     Route("/tv_alert", tv_alert, methods=["POST"]),
+    Route("/telegram/{secret}", telegram_webhook, methods=["POST","GET"]),
 ]
 
 app = Starlette(debug=False, routes=routes)
