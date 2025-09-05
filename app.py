@@ -12,6 +12,7 @@ from policy.state import POLICY
 from scheduling.jobs import start_background
 from scheduling.lease_runner import lease_loop
 from utils.lease_status import LEASE
+from integrations.sheets import SheetsClient
 
 def load_settings(path: str = "config/settings.yaml") -> dict:
     with open(path, "r", encoding="utf-8") as f:
@@ -27,6 +28,7 @@ async def healthz(request):
     metrics = snapshot_metrics()
     policy = POLICY.snapshot()
     lease = LEASE.snapshot()
+    sheets = SheetsClient().status_summary()  # light-weight diag
     return JSONResponse({
         "status": "ok",
         "app": cfg["app"]["name"],
@@ -39,6 +41,7 @@ async def healthz(request):
         "metrics": metrics,
         "policy": policy,
         "lease": lease,
+        "sheets": sheets,
     })
 
 routes = [
@@ -51,14 +54,12 @@ app = Starlette(debug=False, routes=routes)
 
 @app.on_event("startup")
 async def _startup():
-    # Background tasks: policy watchdogs + lease maintenance
     app.state.bg_policy = asyncio.create_task(start_background())
     app.state.bg_lease  = asyncio.create_task(lease_loop())
 
 @app.on_event("shutdown")
 async def _shutdown():
-    # Cancel background tasks cleanly
-    for name in ("bg_policy", "bg_lease"):
+    for name in ("bg_policy","bg_lease"):
         t = getattr(app.state, name, None)
         if t:
             t.cancel()
