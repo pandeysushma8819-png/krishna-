@@ -1,70 +1,103 @@
+# app.py
 from __future__ import annotations
-import os, yaml, asyncio
-from starlette.applications import Starlette
-from starlette.responses import JSONResponse
-from starlette.routing import Route
+import os, time, json, socket
+from typing import Dict, Any
+from flask import Flask, jsonify
+from werkzeug.middleware.proxy_fix import ProxyFix
 
-from utils.time_utils import now_utc, now_ist, fmt
-from utils.budget_guard import BudgetGuard
-from utils.metrics import METRICS, snapshot_metrics
-from routes.tv import tv_alert
-from routes.telegram import telegram_webhook
-from policy.state import POLICY
-from scheduling.jobs import start_background
-from scheduling.lease_runner import lease_loop
-from utils.lease_status import LEASE
-from integrations.sheets import SheetsClient
-from control.state import CONTROL
+APP_NAME = os.getenv("APP_NAME", "krishna-trade-worker")
 
-def load_settings(path: str = "config/settings.yaml") -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+def _bool(env_name: str, default: bool = False) -> bool:
+    v = os.getenv(env_name)
+    if v is None:
+        return default
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
 
-async def root(request):
-    return JSONResponse({"ok": True, "msg": "KTW P4 running. Endpoints: /tv_alert (POST), /healthz (GET), /telegram/<secret> (POST)"})
+def _now_utc_str() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
 
-async def healthz(request):
-    cfg = load_settings()
-    cap = float(os.getenv("OPENAI_BUDGET_USD", cfg["budget"]["openai_budget_usd"]))
-    guard = BudgetGuard(cap, cfg["budget"]["hard_stop"], cfg["budget"]["state_path"])
-    metrics = snapshot_metrics()
-    policy = POLICY.snapshot()
-    lease = LEASE.snapshot()
-    sheets = SheetsClient().status_summary()
-    control = CONTROL.snapshot()
-    return JSONResponse({
-        "status": "ok",
-        "app": cfg["app"]["name"],
-        "utc": fmt(now_utc()),
-        "ist": fmt(now_ist()),
-        "budget_cap": float(cap),
-        "budget_used": float(guard.usage()),
-        "budget_remaining": float(guard.remaining()),
-        "flags": cfg.get("feature_flags", {}),
-        "metrics": metrics,
-        "policy": policy,
-        "lease": lease,
-        "sheets": sheets,
-        "control": control,
-    })
+def _now_ist_str() -> str:
+    # IST = UTC + 5:30, no DST
+    return time.strftime("%Y-%m-%d %H:%M:%S IST", time.gmtime(time.time() + 19800))
 
-routes = [
-    Route("/", root),
-    Route("/healthz", healthz),
-    Route("/tv_alert", tv_alert, methods=["POST"]),
-    Route("/telegram/{secret}", telegram_webhook, methods=["POST","GET"]),
-]
+def _flags() -> Dict[str, Any]:
+    # Same names you see in /healthz to avoid confusion
+    return {
+        "weekend_backtest_only": _bool("WEEKEND_BACKTEST_ONLY", True),
+        "budget_guard_enabled": _bool("BUDGET_GUARD", True) or bool(os.getenv("OPENAI_BUDGET_USD")),
+        "ntp_check_enabled": _bool("NTP_CHECK", True),
+        # TradingView webhook HMAC: set TV_HMAC_REQUIRED=true to require X-TV-Signature
+        "hmac_required": _bool("TV_HMAC_REQUIRED", False),
+    }
 
-app = Starlette(debug=False, routes=routes)
+def _budget() -> Dict[str, float]:
+    cap = float(os.getenv("OPENAI_BUDGET_USD", "23") or 23)
+    # If you persist usage elsewhere, read and show. Here we just expose 0 used.
+    used = float(os.getenv("OPENAI_BUDGET_USED", "0") or 0)
+    remain = max(0.0, cap - used)
+    return {"budget_cap": cap, "budget_used": used, "budget_remaining": remain}
 
-@app.on_event("startup")
-async def _startup():
-    app.state.bg_policy = asyncio.create_task(start_background())
-    app.state.bg_lease  = asyncio.create_task(lease_loop())
+def create_app() -> Flask:
+    app = Flask(__name__)
+    # Render / proxies
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
 
-@app.on_event("shutdown")
-async def _shutdown():
-    for name in ("bg_policy","bg_lease"):
-        t = getattr(app.state, name, None)
-        if t:
-            t.cancel()
+    @app.get("/")
+    def root():
+        """Lightweight ping with status (mirrors style of /healthz header)."""
+        b = _budget()
+        return jsonify(
+            ok=True,
+            app=APP_NAME,
+            host=socket.gethostname(),
+            utc=_now_utc_str(),
+            ist=_now_ist_str(),
+            **b,
+            flags=_flags(),
+        )
+
+    # ------------------ Blueprint registrations ------------------
+    # P1: TradingView webhook + health
+    try:
+        from routes.health import health_bp  # expected to expose /healthz and counters
+        app.register_blueprint(health_bp)
+    except Exception as e:
+        app.logger.warning(f"[boot] health_bp not loaded: {e}")
+
+    try:
+        from routes.tv import tv_bp  # expected to expose /tv_alert (POST)
+        app.register_blueprint(tv_bp)
+    except Exception as e:
+        app.logger.warning(f"[boot] tv_bp not loaded: {e}")
+
+    # P4: Telegram control webhook (/telegram/<hook>)
+    try:
+        from routes.telegram import telegram_bp
+        app.register_blueprint(telegram_bp)
+    except Exception as e:
+        app.logger.warning(f"[boot] telegram_bp not loaded: {e}")
+
+    # P9: Meta-model & anomaly guard (/meta/*)
+    try:
+        from routes.meta import meta_bp
+        app.register_blueprint(meta_bp)
+    except Exception as e:
+        app.logger.warning(f"[boot] meta_bp not loaded: {e}")
+
+    # Optional: CORS for local tests or cross-origin dashboards
+    if _bool("ENABLE_CORS", False):
+        try:
+            from flask_cors import CORS
+            CORS(app, resources={r"/*": {"origins": "*"}})
+            app.logger.info("CORS enabled (all origins)")
+        except Exception as e:
+            app.logger.warning(f"ENABLE_CORS set but flask-cors missing: {e}")
+
+    return app
+
+
+app = create_app()
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
