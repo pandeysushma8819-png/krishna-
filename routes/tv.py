@@ -10,10 +10,10 @@ from utils.ratelimit import GlobalRateLimiter
 from integrations.hmac_verify import verify_hmac
 from integrations.idempotency import idem_hash, IdempotencyTTL
 from integrations.sheets import SheetsClient
+from control.state import CONTROL
 
-# ---- singletons ----
 _rate: GlobalRateLimiter | None = None
-_idem = IdempotencyTTL(ttl_sec=300, max_size=5000)  # 5 min dedupe window
+_idem = IdempotencyTTL(ttl_sec=300, max_size=5000)
 _sheets = SheetsClient()
 
 def _load_settings() -> dict:
@@ -35,7 +35,6 @@ def _pick_header(req: Request, names: list[str]) -> str | None:
     return None
 
 def _extract_fields(payload: dict) -> tuple[str, str, str, str]:
-    # symbol, timeframe, ts, id (with tolerant fallbacks)
     sym = payload.get("symbol") or payload.get("ticker") or payload.get("s") or "UNKNOWN"
     tf  = payload.get("tf") or payload.get("timeframe") or payload.get("interval") or "NA"
     ts  = payload.get("ts") or payload.get("timestamp") or payload.get("time") or payload.get("t")
@@ -51,32 +50,43 @@ async def tv_alert(request: Request):
     cfg = _load_settings()
     METRICS.bump("requests_total")
 
-    # 0) Lease gate — drop if this host is passive
+    # Lease gate
     if not LEASE.is_active():
         METRICS.bump("passive_drop")
         _sheets.log_event("passive_drop", "host not active", "tv")
         return JSONResponse({"ok": True, "passive": True})
 
-    # 1) Global rate-limit
+    # Control gates (P4)
+    c = CONTROL.snapshot()
+    if c.get("panic_on"):
+        METRICS.bump("panic_drops")
+        _sheets.log_event("panic_drop", "panic_on", "tv")
+        return JSONResponse({"ok": True, "blocked": "panic_on"})
+    if not c.get("signals_on", True):
+        METRICS.bump("signals_off_drops")
+        _sheets.log_event("signals_off_drop", "signals_off", "tv")
+        return JSONResponse({"ok": True, "blocked": "signals_off"})
+
+    # Rate-limit
     rl = _get_rate()
     if not rl.allow():
         METRICS.bump("rate_limited")
         return JSONResponse({"ok": False, "error": "rate_limited"}, status_code=429)
 
-    # 2) Small jitter to smooth bursts
+    # Jitter
     jmin = int(cfg["intake"]["jitter_ms_min"])
     jmax = int(cfg["intake"]["jitter_ms_max"])
     if jmax > 0 and jmax >= jmin:
         await asyncio.sleep((jmin + (jmax - jmin) * rl.rand()) / 1000.0)
 
-    # 3) Read body
+    # Body
     try:
         body = await request.body()
     except Exception as e:
         METRICS.bump("errors_total")
         return JSONResponse({"ok": False, "error": f"body_read_failed: {e}"}, status_code=400)
 
-    # 4) HMAC / secret verify
+    # Auth
     secret = os.getenv("TRADINGVIEW_WEBHOOK_SECRET", "")
     h_required = bool(cfg["feature_flags"].get("hmac_required", True))
     sig_header = _pick_header(request, cfg["intake"]["signature_headers"])
@@ -86,7 +96,7 @@ async def tv_alert(request: Request):
         _sheets.log_event("auth_fail", f"{reason}", "tv")
         return JSONResponse({"ok": False, "error": f"auth_failed: {reason}"}, status_code=401)
 
-    # 5) Parse JSON (allow nested string)
+    # JSON parse
     try:
         payload = json.loads(body.decode("utf-8"))
         if isinstance(payload, str):
@@ -98,7 +108,7 @@ async def tv_alert(request: Request):
 
     symbol, tf, ts, sid = _extract_fields(payload)
 
-    # 6) Idempotency
+    # Idempotency
     ihash = idem_hash(symbol, tf, ts, sid, body)
     if _idem.seen(ihash):
         METRICS.bump("duplicates")
@@ -108,13 +118,12 @@ async def tv_alert(request: Request):
 
     _idem.remember(ihash)
 
-    # 7) Log to Sheets (best-effort)
+    # Sheets log (best-effort)
     ok_sheet = _sheets.append_signal(symbol, tf, sid, ihash, status="new", raw=payload,
                                      rtt_ms=int((time.perf_counter() - t0) * 1000))
     if not ok_sheet:
         METRICS.bump("sheet_errors")
 
-    # 8) Metrics & return
     METRICS.bump("success")
     METRICS.observe_latency_ms((time.perf_counter() - t0) * 1000.0)
     METRICS.set_last_signal_now()
