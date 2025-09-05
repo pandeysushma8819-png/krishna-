@@ -5,11 +5,11 @@ import json, hashlib, time
 
 @dataclass
 class StrategySpec:
-    strategy_id: str                # e.g., "ema_cross", "rsi_reversion"
-    params: Dict[str, Any]          # hyperparams
-    seed: int = 0                   # for stochastic generators
-    window: str = ""                # e.g., "2024-01-01..2024-06-30"
-    version: str = ""               # auto: hash of (strategy_id+params+seed)
+    strategy_id: str
+    params: Dict[str, Any]
+    seed: int = 0
+    window: str = ""
+    version: str = ""
 
     def materialize(self) -> "StrategySpec":
         if not self.version:
