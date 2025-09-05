@@ -2,12 +2,6 @@ from __future__ import annotations
 import time, threading
 
 class _Metrics:
-    """
-    Thread-safe in-proc metrics store with:
-    - integer counters
-    - simple EMA latency (ms)
-    - last_signal_ts (epoch seconds)
-    """
     def __init__(self):
         self._lock = threading.Lock()
         self._counters = {
@@ -29,17 +23,22 @@ class _Metrics:
             # lease/handovers (P3)
             "lease_active": 0,
             "passive_drop": 0,
+            # control/kill-switch (P4)
+            "panic_drops": 0,
+            "signals_off_drops": 0,
+            # telegram (P4)
+            "tg_cmds_total": 0,
+            "tg_cmds_denied": 0,
+            "tg_rate_limited": 0,
         }
         self._latency_ema_ms: float = 0.0
         self._ema_alpha: float = 0.2
         self._last_signal_ts: int = 0
 
-    # ---- counters ----
     def bump(self, key: str):
         with self._lock:
             self._counters[key] = self._counters.get(key, 0) + 1
 
-    # ---- latency ----
     def observe_latency_ms(self, ms: float):
         with self._lock:
             ms = float(ms)
@@ -49,12 +48,10 @@ class _Metrics:
                 a = self._ema_alpha
                 self._latency_ema_ms = a * ms + (1.0 - a) * self._latency_ema_ms
 
-    # ---- signal marker ----
     def set_last_signal_now(self):
         with self._lock:
             self._last_signal_ts = int(time.time())
 
-    # ---- snapshot ----
     def snapshot(self) -> dict:
         with self._lock:
             return {
@@ -63,7 +60,6 @@ class _Metrics:
                 "last_signal_ts": self._last_signal_ts,
             }
 
-# global singleton
 METRICS = _Metrics()
 
 def snapshot_metrics() -> dict:
