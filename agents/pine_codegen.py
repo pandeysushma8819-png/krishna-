@@ -9,7 +9,7 @@ def _pine_header(name: str,
                  default_qty_value: float = 1.0,
                  commission_percent: float = 0.03,
                  slippage_ticks: int = 0) -> str:
-    # IMPORTANT: all values below must be constants, not input.* calls
+    # IMPORTANT: Pine ke strategy() header me inputs/series NHI chalega; constants chahiye.
     return f"""//@version=5
 strategy("{name}",
      overlay=true,
@@ -27,7 +27,7 @@ strategy("{name}",
 
 def _inputs_block_qty() -> str:
     return """// === Inputs (UI)
-// These do NOT wire into strategy() header (TV requires constants there).
+// Yeh inputs strategy() header me nahi jaate; header me constants raheinge.
 orderQty = input.float(1.0, "Order size (shares/contracts)", minval=0.0)
 """
 
