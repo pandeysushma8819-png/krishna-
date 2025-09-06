@@ -6,7 +6,7 @@ import logging
 from typing import Any, Dict
 from flask import Flask, jsonify
 
-# ---------- tiny env helpers ----------
+# ----------------- env helpers -----------------
 def _b(name: str, default: bool = False) -> bool:
     v = os.environ.get(name)
     if v is None:
@@ -44,7 +44,7 @@ def _status_payload() -> Dict[str, Any]:
         },
     }
 
-# ---------- app factory ----------
+# ----------------- factory -----------------
 def create_app() -> Flask:
     app = Flask(__name__)
     app.config["JSON_AS_ASCII"] = False
@@ -52,6 +52,11 @@ def create_app() -> Flask:
     @app.get("/")
     def root():
         return jsonify(_status_payload())
+
+    # simple health for Render/CF probes
+    @app.get("/_health")
+    def _health():
+        return "ok", 200
 
     log = app.logger or logging.getLogger(__name__)
 
@@ -62,7 +67,7 @@ def create_app() -> Flask:
     except Exception as e:
         log.warning("[boot] meta_bp not loaded: %s", e)
 
-    # P10: Risk
+    # P10: Risk engine
     try:
         from routes.risk import risk_bp
         app.register_blueprint(risk_bp)
@@ -76,7 +81,14 @@ def create_app() -> Flask:
     except Exception as e:
         log.warning("[boot] report_bp not loaded: %s", e)
 
-    # Optional (older phases) — load if present
+    # P12: Execution adapter + approval gate
+    try:
+        from routes.exec import exec_bp
+        app.register_blueprint(exec_bp)
+    except Exception as e:
+        log.warning("[boot] exec_bp not loaded: %s", e)
+
+    # Optional blueprints from earlier phases (load if file exists)
     try:
         from routes.health import health_bp  # type: ignore
         app.register_blueprint(health_bp)
@@ -97,7 +109,7 @@ def create_app() -> Flask:
 
     return app
 
-# WSGI app
+# WSGI app for Flask
 app = create_app()
 
 # ASGI wrapper (for uvicorn)
