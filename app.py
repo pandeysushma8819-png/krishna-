@@ -49,6 +49,13 @@ def create_app() -> Flask:
     app = Flask(__name__)
     app.config["JSON_AS_ASCII"] = False
 
+    # P14: rotate logs (best-effort)
+    try:
+        from utils.logging_setup import setup_logging
+        setup_logging(app.logger)
+    except Exception:
+        pass
+
     @app.get("/")
     def root():
         return jsonify(_status_payload())
@@ -94,6 +101,13 @@ def create_app() -> Flask:
         app.register_blueprint(data_bp)
     except Exception as e:
         log.warning("[boot] data_bp not loaded: %s", e)
+
+    # P14: DR endpoints
+    try:
+        from routes.dr import dr_bp
+        app.register_blueprint(dr_bp)
+    except Exception as e:
+        log.warning("[boot] dr_bp not loaded: %s", e)
 
     # Optional blueprints from earlier phases (best-effort)
     try:
