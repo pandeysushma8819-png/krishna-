@@ -6,7 +6,7 @@ import logging
 from typing import Any, Dict
 from flask import Flask, jsonify
 
-# ----------------- env helpers -----------------
+# ----------------- small env helpers -----------------
 def _b(name: str, default: bool = False) -> bool:
     v = os.environ.get(name)
     if v is None:
@@ -23,7 +23,7 @@ def _now_utc_str() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
 
 def _now_ist_str() -> str:
-    # IST = UTC + 5:30 (19800 sec)
+    # IST = UTC + 5:30 (19800 seconds)
     return time.strftime("%Y-%m-%d %H:%M:%S IST", time.gmtime(time.time() + 19800))
 
 def _status_payload() -> Dict[str, Any]:
@@ -44,12 +44,12 @@ def _status_payload() -> Dict[str, Any]:
         },
     }
 
-# ----------------- factory -----------------
+# ----------------- application factory -----------------
 def create_app() -> Flask:
     app = Flask(__name__)
     app.config["JSON_AS_ASCII"] = False
 
-    # P14: rotate logs (best-effort)
+    # P14: best-effort rotating file logs (stdout remains default)
     try:
         from utils.logging_setup import setup_logging
         setup_logging(app.logger)
@@ -60,68 +60,78 @@ def create_app() -> Flask:
     def root():
         return jsonify(_status_payload())
 
-    # simple health for Render/CF probes
+    # simple probe for Render/Cloudflare
     @app.get("/_health")
     def _health():
         return "ok", 200
 
     log = app.logger or logging.getLogger(__name__)
 
-    # P9: Meta (regime/anomaly)
+    # --------- P9: Meta (regime/anomaly) ----------
     try:
         from routes.meta import meta_bp
         app.register_blueprint(meta_bp)
     except Exception as e:
         log.warning("[boot] meta_bp not loaded: %s", e)
 
-    # P10: Risk engine
+    # --------- P10: Risk engine ----------
     try:
         from routes.risk import risk_bp
         app.register_blueprint(risk_bp)
     except Exception as e:
         log.warning("[boot] risk_bp not loaded: %s", e)
 
-    # P11: Reports
+    # --------- P11: Reports ----------
     try:
         from routes.report import report_bp
         app.register_blueprint(report_bp)
     except Exception as e:
         log.warning("[boot] report_bp not loaded: %s", e)
 
-    # P12: Execution adapter + approval gate
+    # --------- P12: Execution adapter + approval gate ----------
     try:
         from routes.exec import exec_bp
         app.register_blueprint(exec_bp)
     except Exception as e:
         log.warning("[boot] exec_bp not loaded: %s", e)
 
-    # P13: Data providers & fallback
+    # --------- P13: Data providers & fallback ----------
     try:
         from routes.data import data_bp
         app.register_blueprint(data_bp)
     except Exception as e:
         log.warning("[boot] data_bp not loaded: %s", e)
 
-    # P14: DR endpoints
+    # --------- P14: DR / Snapshots ----------
     try:
         from routes.dr import dr_bp
         app.register_blueprint(dr_bp)
     except Exception as e:
         log.warning("[boot] dr_bp not loaded: %s", e)
 
-    # Optional blueprints from earlier phases (best-effort)
+    # --------- P15: Ops (acceptance KPIs & soak helpers) ----------
+    try:
+        from routes.ops import ops_bp
+        app.register_blueprint(ops_bp)
+    except Exception as e:
+        log.warning("[boot] ops_bp not loaded: %s", e)
+
+    # --------- Optional (earlier phases) ----------
+    # health
     try:
         from routes.health import health_bp  # type: ignore
         app.register_blueprint(health_bp)
     except Exception as e:
         log.warning("[boot] health_bp not loaded: %s", e)
 
+    # TradingView webhook
     try:
         from routes.tv import tv_bp  # type: ignore
         app.register_blueprint(tv_bp)
     except Exception as e:
         log.warning("[boot] tv_bp not loaded: %s", e)
 
+    # Telegram bot webhook
     try:
         from routes.telegram import telegram_bp  # type: ignore
         app.register_blueprint(telegram_bp)
@@ -130,10 +140,10 @@ def create_app() -> Flask:
 
     return app
 
-# WSGI app for Flask
+# WSGI app (Flask)
 app = create_app()
 
-# ASGI wrapper (for uvicorn)
+# ASGI wrapper to allow `uvicorn app:app` or `uvicorn app:asgi_app`
 try:
     from asgiref.wsgi import WsgiToAsgi
     asgi_app = WsgiToAsgi(app)
