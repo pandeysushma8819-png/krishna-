@@ -7,7 +7,7 @@ from meta.anomaly import detect_anomalies, decide_guard
 
 meta_bp = Blueprint("meta", __name__)
 
-@meta_bp.route("/meta/ping")
+@meta_bp.route("/meta/ping", methods=["GET"])
 def ping() -> Any:
     return jsonify(ok=True, msg="meta alive")
 
@@ -16,15 +16,22 @@ def _error(msg: str, code: int = 400):
 
 @meta_bp.route("/meta/scan", methods=["POST"])
 def scan() -> Any:
+    """
+    Body:
+      { "bars": [...], "tf_sec": 900 }
+    """
     data = request.get_json(silent=True) or {}
+
     bars: List[Dict] = data.get("bars", [])
     if not isinstance(bars, list) or not bars:
         return _error("no_bars", 400)
+
     try:
         tf_sec = int(data.get("tf_sec", 900))
     except Exception:
         return _error("invalid tf_sec", 400)
 
+    # minimal schema check on the latest bar
     last = bars[-1]
     for k in ("ts", "open", "high", "low", "close"):
         if k not in last:
