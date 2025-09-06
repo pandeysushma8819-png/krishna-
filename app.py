@@ -88,7 +88,14 @@ def create_app() -> Flask:
     except Exception as e:
         log.warning("[boot] exec_bp not loaded: %s", e)
 
-    # Optional blueprints from earlier phases (load if file exists)
+    # P13: Data providers & fallback
+    try:
+        from routes.data import data_bp
+        app.register_blueprint(data_bp)
+    except Exception as e:
+        log.warning("[boot] data_bp not loaded: %s", e)
+
+    # Optional blueprints from earlier phases (best-effort)
     try:
         from routes.health import health_bp  # type: ignore
         app.register_blueprint(health_bp)
