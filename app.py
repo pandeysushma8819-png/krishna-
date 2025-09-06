@@ -1,13 +1,16 @@
 # app.py
 from __future__ import annotations
-import os, time, logging
+import os
+import time
+import logging
 from typing import Any, Dict
 from flask import Flask, jsonify
 
 # ---------- helpers ----------
 def _read_bool(name: str, default: bool = False) -> bool:
     v = os.environ.get(name)
-    if v is None: return default
+    if v is None:
+        return default
     return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 def _read_float(name: str, default: float = 0.0) -> float:
@@ -20,7 +23,7 @@ def _now_utc_str() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
 
 def _now_ist_str() -> str:
-    # IST = UTC + 5:30 = 19800 seconds
+    # IST = UTC + 5h30m = 19800 sec
     return time.strftime("%Y-%m-%d %H:%M:%S IST", time.gmtime(time.time() + 19800))
 
 def _status_payload() -> Dict[str, Any]:
@@ -51,31 +54,35 @@ def create_app() -> Flask:
     def root():
         return jsonify(_status_payload())
 
-    # register blueprints (optional ones won't crash boot)
     log = app.logger or logging.getLogger(__name__)
 
-    # P9: meta blueprint (required for /meta/ping, /meta/scan)
+    # P9: meta blueprint
     try:
         from routes.meta import meta_bp
         app.register_blueprint(meta_bp)
     except Exception as e:
         log.warning("[boot] meta_bp not loaded: %s", e)
 
-    # Optional: health blueprint (if present in repo)
+    # P10: risk blueprint
+    try:
+        from routes.risk import risk_bp
+        app.register_blueprint(risk_bp)
+    except Exception as e:
+        log.warning("[boot] risk_bp not loaded: %s", e)
+
+    # Optional blueprints (present if earlier phases committed)
     try:
         from routes.health import health_bp  # type: ignore
         app.register_blueprint(health_bp)
     except Exception as e:
         log.warning("[boot] health_bp not loaded: %s", e)
 
-    # Optional: tradingview webhook blueprint
     try:
         from routes.tv import tv_bp  # type: ignore
         app.register_blueprint(tv_bp)
     except Exception as e:
         log.warning("[boot] tv_bp not loaded: %s", e)
 
-    # Optional: telegram blueprint
     try:
         from routes.telegram import telegram_bp  # type: ignore
         app.register_blueprint(telegram_bp)
@@ -90,16 +97,11 @@ app = create_app()
 # ASGI wrapper for uvicorn
 try:
     from asgiref.wsgi import WsgiToAsgi
-    asgiref_available = True
+    asgi_app = WsgiToAsgi(app)  # use this in Render start command
 except Exception:
-    asgiref_available = False
-
-if asgiref_available:
-    asgi_app = WsgiToAsgi(app)  # <-- use this in Render start command
-else:
-    # fallback: expose same name so imports don't break (will still be WSGI)
+    # fallback: expose same name so imports don't break (WSGI)
     asgi_app = app
 
 if __name__ == "__main__":
-    # local dev: python app.py
+    # local dev
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8000")), debug=True)
