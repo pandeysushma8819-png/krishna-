@@ -1,269 +1,325 @@
 # strategies/my_strategy.py
-# -*- coding: utf-8 -*-
-"""
-MASTER 15m v1.1 — BUY+SELL (Python port, long-only engine friendly)
-
-- BUY/SELL दोनों rules मौजूद हैं.
-- Engine long-only होने के कारण SELL अभी shorts नहीं खोलता, लेकिन
-  valid SELL आने पर नए BUY entries रोक देता है (और चाहें तो flatten भी कर सकते हैं).
-- Per-symbol target:
-    * BTC*: fixed 1500 points
-    * XAUUSD / XAGUSD / EURUSD / USDJPY (+ common aliases): RR = 1:5
-"""
-
 from __future__ import annotations
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Optional
+from collections import deque
 import math
+import datetime as dt
 
-# ---------- utils ----------
-def sma(seq: List[float], n: int) -> List[float]:
-    out, s, q = [], 0.0, []
-    for x in seq:
-        q.append(x); s += x
+# -----------------------------
+# Helpers
+# -----------------------------
+def rolling_sma(vals: List[float], n: int) -> List[Optional[float]]:
+    out: List[Optional[float]] = [None]*len(vals)
+    if n <= 1:
+        return [float(x) for x in vals]
+    s = 0.0
+    q = deque()
+    for i, x in enumerate(vals):
+        q.append(x)
+        s += x
         if len(q) > n:
-            s -= q.pop(0)
-        out.append(s / len(q) if q else float("nan"))
+            s -= q.popleft()
+        if len(q) == n:
+            out[i] = s / n
     return out
 
-def highest_prev(seq: List[float], i: int, width: int) -> float:
-    if width <= 0 or i <= 0:
+def highest_prev(vals: List[float], i: int, lookback: int) -> float:
+    """highest of previous N (exclude current i)"""
+    j0 = max(0, i - lookback)
+    j1 = max(0, i - 1)
+    if j1 < j0:
         return float("-inf")
-    j0 = max(0, i - width)
-    if j0 >= i:
-        return float("-inf")
-    return max(seq[j0:i])
+    return max(vals[j0:j1+1]) if j1 >= j0 else float("-inf")
 
-def day_key(ts: int) -> int:
-    return (ts // 86400) * 86400
+def day_key(ts_sec: int) -> dt.date:
+    # UTC date bucket
+    return dt.datetime.utcfromtimestamp(ts_sec).date()
 
-def build_daily_prev_state(bars: List[dict]) -> Dict[int, Tuple[float, float]]:
-    by_day: Dict[int, List[dict]] = {}
+def resample_daily_close(bars: List[dict]) -> List[tuple[dt.date, float]]:
+    if not bars:
+        return []
+    by_day: Dict[dt.date, float] = {}
+    last_day = None
+    last_close = None
     for b in bars:
-        by_day.setdefault(day_key(int(b["ts"])), []).append(b)
-    days = sorted(by_day.keys())
-    day_end_close = {d: float(by_day[d][-1]["close"]) for d in days}
-    day_prev: Dict[int, Tuple[float, float]] = {}
-    hist: List[float] = []
-    for d in days:
-        prev_c = hist[-1] if hist else float("nan")
-        prev_s = (sum(hist[-9:]) / len(hist[-9:])) if hist else float("nan")
-        day_prev[d] = (prev_c, prev_s)
-        hist.append(day_end_close[d])
-    return day_prev
+        d = day_key(int(b["ts"]))
+        c = float(b["close"])
+        # overwrite till end of day -> last close of that day
+        by_day[d] = c
+        last_day = d
+        last_close = c
+    items = sorted(by_day.items(), key=lambda kv: kv[0])
+    return items  # [(date, close)]
 
-def pick_side_locks(side_mode: str, use_daily9: bool, dPrevC: float, dPrevS9: float) -> Tuple[bool, bool]:
-    sm = (side_mode or "auto").strip().lower()
-    if sm in ("manual buy", "manual_buy", "buy_only", "buy"):
-        return True, False
-    if sm in ("manual sell", "manual_sell", "sell_only", "sell"):
-        return False, True
-    if sm in ("off", "none"):
-        return True, True
-    # auto (daily-sticky)
-    if not use_daily9 or (math.isnan(dPrevC) or math.isnan(dPrevS9)):
-        return True, True
-    bullish = dPrevC > dPrevS9
-    bearish = dPrevC < dPrevS9
-    return bullish, bearish
-
-# ---------- per-symbol TP policy ----------
-FX_METALS = {"XAUUSD","XAGUSD","GOLD","SILVER","EURUSD","USDJPY"}
-def _is_btc(sym: str) -> bool:
-    s = (sym or "").upper()
-    return "BTC" in s
-
-def _is_fx_metals(sym: str) -> bool:
-    s = (sym or "").upper()
-    return any(tag in s for tag in FX_METALS)
-
-def _resolve_target_policy(symbol: str, P: Dict[str, Any]) -> Dict[str, Any]:
-    """Return dict with keys: target_mode in {"fixed_pts","rr"}, target_pts, rr_multiple."""
-    # explicit params override auto
-    if "target_mode" in P:
-        mode = str(P["target_mode"]).lower()
-        return {
-            "target_mode": mode,
-            "target_pts": float(P.get("target_pts", 50.0)),
-            "rr_multiple": float(P.get("rr_multiple", 5.0))
-        }
-    # auto by symbol
-    if _is_btc(symbol):
-        return {"target_mode":"fixed_pts", "target_pts":1500.0, "rr_multiple":5.0}
-    if _is_fx_metals(symbol):
-        return {"target_mode":"rr", "target_pts":50.0, "rr_multiple":5.0}
-    # default
-    return {"target_mode":"fixed_pts", "target_pts":50.0, "rr_multiple":5.0}
-
-def _compute_tp(entry: float, sl: float, side: str, policy: Dict[str, Any]) -> float:
-    mode = policy["target_mode"]
-    if mode == "fixed_pts":
-        pts = float(policy["target_pts"])
-        return entry + pts if side == "long" else entry - pts
-    # rr mode
-    rr = float(policy["rr_multiple"])
-    risk = abs(entry - sl)
-    gain = rr * risk
-    return entry + gain if side == "long" else entry - gain
-
-# ---------- params ----------
-def _coerce_params(params: Dict[str, Any]) -> Dict[str, Any]:
-    p = dict(params or {})
-    # legacy
-    if "volN" not in p and "vol_peakN" in p: p["volN"] = p["vol_peakN"]
-    if "volK" not in p and "vol_k" in p: p["volK"] = p["vol_k"]
-    if "target_pts" not in p and "tp_pts" in p: p["target_pts"] = p["tp_pts"]
-    if "side_mode" not in p and "mode" in p:
-        m = str(p["mode"]).lower()
-        p["side_mode"] = {"auto":"auto","buy_only":"manual_buy","sell_only":"manual_sell","off":"off"}.get(m, "auto")
-    if "use_daily9" not in p and "daily_filter" in p: p["use_daily9"] = bool(p["daily_filter"])
-    if "need_color" not in p and "require_green_entry" in p: p["need_color"] = bool(p["require_green_entry"])
-    # eps
-    if "align_eps" in p: eps = float(p["align_eps"])
-    elif "eps_pct" in p: eps = float(p["eps_pct"]) * 0.01
-    else: eps = 0.003
-    p["align_eps"] = eps
-    # defaults
-    p.setdefault("tf_sec", 900)
-    p.setdefault("side_mode", "auto")
-    p.setdefault("use_daily9", True)
-    p.setdefault("vol_mode", "SMA*k")
-    p.setdefault("volN", 20)
-    p.setdefault("volK", 1.10)
-    p.setdefault("need_color", False)
-    p.setdefault("entry_mode", "Strict")
-    p.setdefault("target_pts", 50.0)
-    p.setdefault("rr_multiple", 5.0)
-    p.setdefault("long_only", True)
-    p.setdefault("symbol", "")
-    return p
-
-# ---------- main (long-only series 0/1) ----------
-def make_target(bars: List[dict], params: Dict[str, Any]) -> Dict[str, int]:
+def daily_lock_flags_for_today(bars: List[dict]) -> tuple[bool, bool]:
     """
-    Returns {ts: 0/1} for LONG position (engine long-only).
-    BUY rules open long; SELL rules block new buys (and can flatten if desired).
+    Pine logic used previous day close vs 9MA[1].
+    We'll build daily closes, SMA9, then compare prev-day close to prev-day SMA9.
+    Returns (dBullish, dBearish); if not enough history, both True (don't block).
     """
-    P = _coerce_params(params)
-    tf = int(P["tf_sec"])
-    assert tf == 900, f"Expected 15m bars (tf_sec=900), got {tf}"
-    symbol = str(P.get("symbol", ""))
+    daily = resample_daily_close(bars)
+    if len(daily) < 2:  # need prev-day at least
+        return True, True
+    closes = [c for _, c in daily]
+    sma9 = rolling_sma(closes, 9)
+    # index for prev day
+    i_prev = len(closes) - 2
+    if sma9[i_prev] is None:
+        return True, True
+    d_close_prev = closes[i_prev]
+    d_sma9_prev = sma9[i_prev]
+    d_bull = d_close_prev > d_sma9_prev
+    d_bear = d_close_prev < d_sma9_prev
+    return d_bull, d_bear
 
-    n = len(bars)
-    if n == 0: return {}
+def is_btc(symbol: str) -> bool:
+    s = (symbol or "").upper()
+    return "BTC" in s or "XBT" in s
 
+def is_rr_15_symbol(symbol: str) -> bool:
+    s = (symbol or "").upper()
+    return any(t in s for t in ["XAU", "GOLD", "XAG", "SILVER", "EURUSD", "USDJPY"])
+
+# -----------------------------
+# CORE: compute_positions
+# -----------------------------
+def compute_positions(bars: List[dict], params: Dict[str, Any]) -> Dict[str, int]:
+    """
+    Returns a sparse mapping { "ts": side } where side in { -1, 0, +1 },
+    emitted only when state changes. Engine opens/closes from these transitions.
+
+    Strategy = 15m valid level + 15m entry (Strict/Crossover)
+      - Volume filter: "SMA*k" (default) or "HighestN"
+      - Lock: Auto (Daily 9MA sticky), Manual BUY/SELL, or Off
+      - Align with 15m MA50 within epsilon
+      - Entry color optional
+      - Recycle when MA50 crosses (invalidate stored level)
+      - Exits (for 0-state): emulate SL/TP using close vs entry bar's high/low
+         * BTCUSDT: fixed TP = 1500 (price units)
+         * XAU/XAG/EURUSD/USDJPY: TP = 5 * risk (risk = entryC - entryBarLow for long; entryBarHigh - entryC for short)
+    """
+    if not bars:
+        return {}
+
+    # -------- params --------
+    symbol: str = params.get("symbol", "")
+    tf_sec: int = int(params.get("tf_sec", 900))
+    side_mode: str = (params.get("side_mode") or "auto").lower()  # 'auto','manual buy','manual sell','off'
+    use_daily9: bool = bool(params.get("use_daily9", True))
+    vol_mode: str = (params.get("vol_mode") or "SMA*k").lower()   # 'sma*k' or 'highestn'
+    vol_k: float = float(params.get("vol_k", 1.10))
+    volN: int = int(params.get("volN", 20))
+    align_eps: float = float(params.get("align_eps", 0.003))      # 0.3% = 0.003
+    need_color: bool = bool(params.get("need_color", False))
+    entry_mode: str = (params.get("entry_mode") or "Strict").lower()  # 'strict' or 'crossover'
+    long_only: bool = bool(params.get("long_only", False))
+
+    # -------- arrays --------
     O = [float(b["open"])  for b in bars]
     H = [float(b["high"])  for b in bars]
     L = [float(b["low"])   for b in bars]
     C = [float(b["close"]) for b in bars]
-    V = [float(b["volume"]) for b in bars]
+    V = [float(b.get("volume", 0.0)) for b in bars]
     TS= [int(b["ts"]) for b in bars]
 
-    m50 = sma(C, 50)
-    vS  = sma(V, 20)
-    day_prev_map = build_daily_prev_state(bars)
+    # 15m MA50 (close) and VolSMA20
+    ma50 = rolling_sma(C, 50)
+    volS = rolling_sma(V, 20)
 
-    # states
-    buyLvl, bSrcL = math.nan, math.nan
-    sellLvl, sSrcH = math.nan, math.nan
-    pos, sl, tp = 0, math.nan, math.nan
+    # daily lock (sticky for the whole current day, using prev-day info)
+    dBull, dBear = daily_lock_flags_for_today(bars)
 
-    # params
-    side_mode  = str(P["side_mode"])
-    use_daily9 = bool(P["use_daily9"])
-    vol_mode   = str(P["vol_mode"]).lower()
-    volN       = int(P["volN"])
-    volK       = float(P["volK"])
-    need_color = bool(P["need_color"])
-    entry_mode = str(P["entry_mode"]).lower()
-    eps        = float(P["align_eps"])
-    long_only  = bool(P["long_only"])
+    def side_locks():
+        # allowed sides wrt side_mode + daily
+        if side_mode.startswith("manual buy"):
+            buy_allowed, sell_allowed = True, False
+        elif side_mode.startswith("manual sell"):
+            buy_allowed, sell_allowed = False, True
+        elif side_mode in ("off", "none"):
+            buy_allowed, sell_allowed = True, True
+        else:
+            # auto
+            if not use_daily9:
+                buy_allowed, sell_allowed = True, True
+            else:
+                buy_allowed, sell_allowed = dBull, dBear
+        return buy_allowed, sell_allowed
 
-    policy = _resolve_target_policy(symbol, P)
+    buy_allowed, sell_allowed = side_locks()
 
+    # state for levels
+    buyLvl: Optional[float] = None
+    bSrcIdx: Optional[int] = None  # index of valid bar
+    sellLvl: Optional[float] = None
+    sSrcIdx: Optional[int] = None
+
+    # position state
+    pos = 0               # -1/0/+1
+    last_emitted = None   # last emitted state in result
     out: Dict[str, int] = {}
 
-    for i in range(n):
-        ts = TS[i]
-        c, o, h, l = C[i], O[i], H[i], L[i]
-        prev_c = C[i-1] if i > 0 else c
+    # entry detail for TP/SL emulation
+    entry_i = None
+    entry_price = None
+    entry_bar_low = None
+    entry_bar_high = None
 
-        # daily lock
-        dPrevC, dPrevS9 = day_prev_map.get(day_key(ts), (float("nan"), float("nan")))
-        buyAllowed, sellAllowed = pick_side_locks(side_mode, use_daily9, dPrevC, dPrevS9)
-        if side_mode.lower() == "off":
-            buyAllowed = True; sellAllowed = True
+    # TP policy
+    def compute_tp_sl_for_long(i_entry: int, entry_close: float) -> tuple[float, float]:
+        # SL = entry bar low; TP either fixed 1500 for BTC or 5*risk otherwise
+        sl = L[i_entry]
+        risk = max(1e-9, entry_close - sl)
+        if is_btc(symbol):
+            tp = entry_close + 1500.0
+        elif is_rr_15_symbol(symbol):
+            tp = entry_close + 5.0 * risk
+        else:
+            # default: also RR 1:5
+            tp = entry_close + 5.0 * risk
+        return tp, sl
 
-        m50_i = m50[i]; have_m50 = not math.isnan(m50_i)
+    def compute_tp_sl_for_short(i_entry: int, entry_close: float) -> tuple[float, float]:
+        # SL = entry bar high; TP either fixed 1500 for BTC or 5*risk otherwise
+        sl = H[i_entry]
+        risk = max(1e-9, sl - entry_close)
+        if is_btc(symbol):
+            tp = entry_close - 1500.0
+        elif is_rr_15_symbol(symbol):
+            tp = entry_close - 5.0 * risk
+        else:
+            tp = entry_close - 5.0 * risk
+        return tp, sl
 
-        # recycle invalidate
-        recycleB = have_m50 and ((c > m50_i) or (min(o, c) > m50_i))
-        recycleS = have_m50 and ((c < m50_i) or (max(o, c) < m50_i))
-        if recycleB: buyLvl, bSrcL = math.nan, math.nan
-        if recycleS: sellLvl, sSrcH = math.nan, math.nan
+    def emit(i: int, new_pos: int):
+        nonlocal last_emitted, pos
+        pos = new_pos
+        if last_emitted != pos:
+            out[str(TS[i])] = pos
+            last_emitted = pos
 
-        # 15m valid BUY
-        isRed = c < o
-        bodyBelow = have_m50 and (max(o, c) < m50_i)
-        volStrictB = (V[i] > vS[i]) and (V[i] > highest_prev(V, i, volN))
-        volSoftB   = (V[i] > vS[i] * volK)
-        volPassB   = volStrictB if (vol_mode == "highestn") else volSoftB
-        buyValid   = buyAllowed and isRed and have_m50 and (c < m50_i) and bodyBelow and volPassB
+    # iterate bars
+    for i in range(len(bars)):
+        c = C[i]; o = O[i]; h = H[i]; l = L[i]
+        c_prev = C[i-1] if i > 0 else c
+        m50 = ma50[i]
+        v = V[i]
+        vS = volS[i]
 
-        # 15m valid SELL
-        isGreen = c > o
-        bodyAbove = have_m50 and (min(o, c) > m50_i)
-        volStrictS = (V[i] > vS[i]) and (V[i] > highest_prev(V, i, volN))
-        volSoftS   = (V[i] > vS[i] * volK)
-        volPassS   = volStrictS if (vol_mode == "highestn") else volSoftS
-        sellValid  = sellAllowed and isGreen and have_m50 and (c > m50_i) and bodyAbove and volPassS
+        # not enough warmup?
+        if m50 is None or vS is None:
+            if i == 0:
+                emit(i, 0)
+            # still flat until warm
+            continue
 
-        # lifecycle
-        if buyValid:
+        # volume pass
+        if vol_mode == "highestn":
+            vTop = highest_prev(V, i, volN)
+            vol_pass_buy  = (v > vS) and (v > vTop)
+            vol_pass_sell = (v > vS) and (v > vTop)
+        else:
+            # SMA*k
+            vol_pass_buy  = v > vS * vol_k
+            vol_pass_sell = v > vS * vol_k
+
+        # valid candles
+        is_red = c < o
+        is_green = c > o
+        body_below = max(o, c) < m50   # touch invalid
+        body_above = min(o, c) > m50
+
+        buy_valid  = is_red   and (c < m50) and body_below and vol_pass_buy  and buy_allowed
+        sell_valid = is_green and (c > m50) and body_above and vol_pass_sell and sell_allowed
+
+        # recycle invalidate (MA50 cross style)
+        recycleB = (c > m50) or (min(o, c) > m50)
+        recycleS = (c < m50) or (max(o, c) < m50)
+        if recycleB:
+            buyLvl = None
+            bSrcIdx = None
+        if recycleS:
+            sellLvl = None
+            sSrcIdx = None
+
+        # set/overwrite levels on valid bars
+        if buy_valid:
             buyLvl = h
-            bSrcL  = l
-        if sellValid:
+            bSrcIdx = i
+        if sell_valid:
             sellLvl = l
-            sSrcH   = h
+            sSrcIdx = i
 
-        # gates
-        alignB = have_m50 and (c <= m50_i * (1.0 + eps))
-        alignS = have_m50 and (c >= m50_i * (1.0 - eps))
-        colorB = (not need_color) or (c > o)      # green
-        colorS = (not need_color) or (c < o)      # red
-
-        # break Strict/Crossover
-        breakBS = (not math.isnan(buyLvl))  and (c > buyLvl)  and (prev_c <= buyLvl)
-        breakBC = (not math.isnan(buyLvl))  and (prev_c <= buyLvl < c)
-        breakB  = breakBS if (entry_mode == "strict") else breakBC
-
-        breakSS = (not math.isnan(sellLvl)) and (c < sellLvl) and (prev_c >= sellLvl)
-        breakSC = (not math.isnan(sellLvl)) and (c < sellLvl <= prev_c)
-        breakS  = breakSS if (entry_mode == "strict") else breakSC
-
-        # exits for existing long
-        if pos == 1:
-            if l <= sl:  # stop first
-                pos = 0; sl = tp = math.nan
-            elif h >= tp:  # then target
-                pos = 0; sl = tp = math.nan
-
-        # entries only if flat
+        # Entries (only if flat)
         if pos == 0:
-            doBuy  = buyAllowed  and breakB and alignB and colorB
-            doSell = sellAllowed and breakS and alignS and colorS
+            eps = align_eps
+            # BUY gates
+            alignB = c <= m50 * (1.0 + eps)
+            colorB = (not need_color) or (c > o)
+            if buyLvl is not None:
+                if entry_mode == "strict":
+                    breakB = (c > buyLvl) and (c_prev <= buyLvl)
+                else:
+                    # crossover
+                    breakB = (c_prev <= buyLvl) and (c > buyLvl)
+            else:
+                breakB = False
+            doBuy = buy_allowed and (not long_only or long_only) and breakB and alignB and colorB  # long_only doesn't block buy
             if doBuy:
-                pos = 1
-                # SL = entry-candle low, TP per policy
-                sl  = bSrcL if not math.isnan(bSrcL) else l
-                tp  = _compute_tp(entry=c, sl=sl, side="long", policy=policy)
-            elif doSell:
-                # long-only: SELL नया long रोकेगा (optional: flatten करें तो यहाँ pos=0 ही है)
-                pass
+                # enter long
+                emit(i, +1)
+                entry_i = i
+                entry_price = c
+                entry_bar_low = l
+                entry_bar_high = h
+                continue
 
-        out[str(ts)] = 1 if pos == 1 else 0
+            # SELL gates (only if not long_only)
+            if not long_only:
+                alignS = c >= m50 * (1.0 - eps)
+                colorS = (not need_color) or (c < o)
+                if sellLvl is not None:
+                    if entry_mode == "strict":
+                        breakS = (c < sellLvl) and (c_prev >= sellLvl)
+                    else:
+                        breakS = (c_prev >= sellLvl) and (c < sellLvl)
+                else:
+                    breakS = False
+                doSell = sell_allowed and breakS and alignS and colorS
+                if doSell:
+                    emit(i, -1)
+                    entry_i = i
+                    entry_price = c
+                    entry_bar_low = l
+                    entry_bar_high = h
+                    continue
+
+        # Exits (SL/TP emulation with close)
+        else:
+            # LONG
+            if pos == +1 and entry_i is not None and entry_price is not None:
+                tp, sl = compute_tp_sl_for_long(entry_i, entry_price)
+                # SL -> close <= sl ;  TP -> close >= tp
+                if c <= sl or c >= tp:
+                    emit(i, 0)
+                    entry_i = entry_price = entry_bar_low = entry_bar_high = None
+                    # do not auto-flip same bar; next bar may re-enter
+                    continue
+
+            # SHORT
+            if pos == -1 and entry_i is not None and entry_price is not None:
+                tp, sl = compute_tp_sl_for_short(entry_i, entry_price)
+                # SL -> close >= sl ;  TP -> close <= tp
+                if c >= sl or c <= tp:
+                    emit(i, 0)
+                    entry_i = entry_price = entry_bar_low = entry_bar_high = None
+                    continue
+
+        # Ensure we start with an initial state at first bar
+        if i == 0 and last_emitted is None:
+            emit(i, 0)
+
+    # End: if still in some position, emit flat at last bar to realize PnL in engine
+    if pos != 0:
+        emit(len(bars)-1, 0)
 
     return out
-
-# aliases
-def generate_target(bars: List[dict], params: Dict[str, Any]) -> Dict[str, int]:
-    return make_target(bars, params)
