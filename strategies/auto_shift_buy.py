@@ -1,231 +1,262 @@
 # strategies/auto_shift_buy.py
-# Krishna Trade Worker (v3) — Auto-Shift BUY System plugin
-# BUY-only, target-only exit, auto-shift 4H→D→W→M (highest active TF wins),
-# RED + High-Volume entry, ECR 10% re-entry gate, per-window quota ≤ 4,
-# pyramiding cap ≤ 4, bar-close-only evaluation, no SL (target-only).
+# KTW v3 — Auto-Shift BUY System (HTF only: 4H/D/W/M)
+# BUY-only, target-only exit (no SL), Active TF = highest TF with discount (close < MA50).
+# Valid BUY = RED + High Volume (Vol > SMA20 AND > prev bar vol) on ACTIVE TF close.
+# Re-entry gate = ECR 10% overlap. Per-TF window quota = 4. Global cap = NONE (entries don't stop across TFs).
+# Exit = EXIT ALL when (close - avg_entry) >= 1000 * (#open entries), checked each 4H close.
+#
+# I/O (project style):
+#   - generate_trades(df4h, params) -> List[Dict] each with: entry_ts, exit_ts, entry_px, exit_px, tf, pnl, status
+#   - to_target_json(trades) -> {"version":1, "trades":[...]}
+#
+# CSV helper (optional):
+#   python strategies/auto_shift_buy.py data_4h.csv '{"target_per_entry":1000}'
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 
 
 @dataclass
 class Params:
-    target_per_entry: float = 1000.0   # Target points per open entry
+    target_per_entry: float = 1000.0   # cumulative TP per open entry
     ma_len: int = 50                   # MA50 for all TFs
     vol_sma_len: int = 20              # Vol SMA for HV check
-    overlap_pct: float = 10.0          # ECR re-entry overlap max (% of prior ECR range)
-    pyramiding_cap: int = 4            # Max total open entries
-    tol: float = 1e-6                  # Tiny tolerance for comparisons
+    ecr_overlap_pct: float = 10.0      # max allowed overlap (% of prior ECR range)
+    max_entries_per_window: int = 4    # PER TF window quota
+    tol: float = 1e-6                  # tiny tolerance
 
 
-TF_RULE = {
-    "4H": "4H",
-    "D" : "1D",
-    "W" : "1W",
-    "M" : "1M",
-}
-
-
+# ---------- utils ----------
 def _as_dt_index(df: pd.DataFrame) -> pd.DataFrame:
-    if "ts" not in df.columns:
-        raise ValueError("Input DataFrame must have column 'ts'")
-    req = ["open", "high", "low", "close", "volume"]
-    for c in req:
-        if c not in df.columns:
-            raise ValueError(f"Missing required column: {c}")
-    df = df.copy()
-    if not np.issubdtype(df["ts"].dtype, np.datetime64):
-        df["ts"] = pd.to_datetime(df["ts"], utc=True, errors="coerce")
-    return df.set_index("ts").sort_index()
+    need = ["ts", "open", "high", "low", "close", "volume"]
+    miss = [c for c in need if c not in df.columns]
+    if miss:
+        raise ValueError(f"Missing columns: {miss}")
+    out = df.copy()
+    if not np.issubdtype(out["ts"].dtype, np.datetime64):
+        out["ts"] = pd.to_datetime(out["ts"], utc=True, errors="coerce")
+    return out.set_index("ts").sort_index()
 
+def _sma(s: pd.Series, n: int) -> pd.Series:
+    return s.rolling(n, min_periods=n).mean()
 
-def _resample(df15: pd.DataFrame, rule: str, ma_len: int, vol_len: int) -> pd.DataFrame:
-    # Standard OHLCV resample with volume sum, then MA50 & VolSMA
-    agg = {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
-    out = df15.resample(rule).agg(agg).dropna(how="any")
-    out["ma"] = out["close"].rolling(ma_len, min_periods=ma_len).mean()
-    out["vsma"] = out["volume"].rolling(vol_len, min_periods=vol_len).mean()
-    out["prev_vol"] = out["volume"].shift(1)
-    # Strict discount regime: close < MA (equal = OFF)
-    out["reg_on"] = out["close"] < out["ma"]
-    return out
+def _resample(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    agg = {"open":"first","high":"max","low":"min","close":"last","volume":"sum"}
+    return df.resample(rule).agg(agg).dropna(how="any")
 
+def _align_close_flags(base_idx: pd.DatetimeIndex, tf_idx: pd.DatetimeIndex) -> pd.Series:
+    s = pd.Series(False, index=base_idx)
+    if len(tf_idx):
+        s.loc[s.index.isin(tf_idx)] = True
+    return s
 
-def _ffill_to_15m(tf_df: pd.DataFrame, idx15: pd.DatetimeIndex, col: str) -> pd.Series:
-    return tf_df[col].reindex(idx15, method="ffill")
+def _overlap_len(l1: float, h1: float, l2: float, h2: float) -> float:
+    lo = max(l1, l2); hi = min(h1, h2)
+    return max(0.0, hi - lo)
 
-
-def _flags_tf_closed(idx15: pd.DatetimeIndex, tf_idx: pd.DatetimeIndex) -> pd.Series:
-    """True on 15m bars that coincide with TF close."""
-    flag = pd.Series(False, index=idx15)
-    common = idx15.intersection(tf_idx)
-    if len(common):
-        flag.loc[common] = True
-    return flag
-
-
-def _choose_active(reg4h: bool, regD: bool, regW: bool, regM: bool) -> Optional[str]:
-    # Highest TF takes priority: M > W > D > 4H
+def _choose_active(reg4: bool, regD: bool, regW: bool, regM: bool) -> Optional[str]:
+    # Highest ON wins — Monthly > Weekly > Daily > 4H
     if regM: return "M"
     if regW: return "W"
     if regD: return "D"
-    if reg4h: return "4H"
+    if reg4: return "4H"
     return None
 
 
-def _overlap_len(low1: float, high1: float, low2: float, high2: float) -> float:
-    intr_low = max(low1, low2)
-    intr_high = min(high1, high2)
-    return max(0.0, intr_high - intr_low)
+# ---------- engine ----------
+class AutoShiftBuy:
+    def __init__(self, df4h: pd.DataFrame, p: Params):
+        self.p = p
+        self.base = _as_dt_index(df4h)  # 4H base grid
+        # 4H indicators
+        self.base["ma"] = _sma(self.base["close"], p.ma_len)
+        self.base["vsma"] = _sma(self.base["volume"], p.vol_sma_len)
+        self.base["prev_vol"] = self.base["volume"].shift(1)
+        self.base["reg"] = self.base["close"] < self.base["ma"]
 
+        # Resample to HTFs
+        D = _resample(self.base, "1D")
+        W = _resample(self.base, "1W")
+        M = _resample(self.base, "1M")
+        for tdf in (D, W, M):
+            tdf["ma"] = _sma(tdf["close"], p.ma_len)
+            tdf["vsma"] = _sma(tdf["volume"], p.vol_sma_len)
+            tdf["prev_vol"] = tdf["volume"].shift(1)
+            tdf["reg"] = tdf["close"] < tdf["ma"]
 
-def generate_trades(df15: pd.DataFrame, params: Dict | Params) -> List[Dict]:
-    """
-    Input df15: 15m OHLCV with columns [ts, open, high, low, close, volume]
-    Returns: list of closed trades with entry/exit details.
-    """
-    p = Params(**params) if isinstance(params, dict) else params
-    if df15.empty:
-        return []
+        # forward-fill fields to 4H grid + TF-close flags
+        self.tf = {
+            "4H": {
+                "df": self.base[["open","high","low","close","volume"]],
+                "ma": self.base["ma"], "vsma": self.base["vsma"],
+                "prev_vol": self.base["prev_vol"], "reg": self.base["reg"],
+                "closed": pd.Series(True, index=self.base.index),
+            },
+            "D":  self._pack_tf(D),
+            "W":  self._pack_tf(W),
+            "M":  self._pack_tf(M),
+        }
 
-    base = _as_dt_index(df15)
+        # per-TF window state
+        self.win_on = {k: False for k in self.tf}
+        self.ents = {k: 0 for k in self.tf}  # entries used in current window
+        self.prev_reg = {k: False for k in self.tf}
 
-    # Build TF resamples
-    tf_frames = {tf: _resample(base, TF_RULE[tf], p.ma_len, p.vol_sma_len) for tf in TF_RULE}
+        # ECR & positions
+        self.ecr_low: Optional[float] = None
+        self.ecr_high: Optional[float] = None
+        self.open_entries: List[Dict] = []     # [{ts, px, tf}]
+        self.trades: List[Dict] = []           # per-entry closed trades
 
-    # Forward-fill regimes to 15m timeline
-    reg_ff = {tf: _ffill_to_15m(tf_frames[tf], base.index, "reg_on").fillna(False) for tf in TF_RULE}
-    # Mark TF close instants on 15m grid
-    tf_closed = {tf: _flags_tf_closed(base.index, tf_frames[tf].index) for tf in TF_RULE}
+    def _pack_tf(self, tdf: pd.DataFrame) -> Dict[str, pd.Series | pd.DataFrame]:
+        f = {
+            "df": tdf[["open","high","low","close","volume"]],
+            "ma": tdf["ma"],
+            "vsma": tdf["vsma"],
+            "prev_vol": tdf["prev_vol"],
+            "reg": tdf["reg"],
+            "closed": _align_close_flags(self.base.index, tdf.index),
+        }
+        # forward-fill series onto base grid
+        for k in ("ma","vsma","prev_vol","reg"):
+            f[k] = f[k].reindex(self.base.index, method="ffill")
+        return f
 
-    # Precompute forward-filled fields (open/high/low/close/volume/vsma/prev_vol/ma/reg_on)
-    ffields: Dict[str, Dict[str, pd.Series]] = {}
-    for tf, fr in tf_frames.items():
-        fields = {}
-        for col in ["open", "high", "low", "close", "volume", "vsma", "prev_vol", "ma", "reg_on"]:
-            fields[col] = fr[col].reindex(base.index, method="ffill")
-        ffields[tf] = fields
+    # ---- helpers ----
+    def _update_windows(self, t: pd.Timestamp, i: int):
+        for tf in ("4H","D","W","M"):
+            closed = bool(self.tf[tf]["closed"].iat[i])
+            if not closed:
+                continue
+            reg_now = bool(self.tf[tf]["reg"].iat[i])
+            if reg_now and not self.prev_reg[tf]:
+                self.win_on[tf] = True
+                self.ents[tf] = 0
+            elif (not reg_now) and self.win_on[tf]:
+                self.win_on[tf] = False
+            self.prev_reg[tf] = reg_now
 
-    # Per-TF windows & entry counters
-    win_on = {tf: False for tf in TF_RULE}   # ON between OFF→ON and ON→OFF
-    ents = {tf: 0 for tf in TF_RULE}         # entries taken in current window
-    prev_reg = {tf: False for tf in TF_RULE} # to detect transitions at TF closes
+    def _active_tf(self, i: int) -> Optional[str]:
+        return _choose_active(bool(self.tf["4H"]["reg"].iat[i]),
+                              bool(self.tf["D"]["reg"].iat[i]),
+                              bool(self.tf["W"]["reg"].iat[i]),
+                              bool(self.tf["M"]["reg"].iat[i]))
 
-    # ECR (Entry Candle Range) from last entry candle (active TF)
-    ecr_low: Optional[float] = None
-    ecr_high: Optional[float] = None
+    def _valid_buy_on(self, tf: str, t: pd.Timestamp, i: int) -> Tuple[bool, float, float, float]:
+        # (valid?, close_px, tf_low, tf_high)
+        if tf == "4H":
+            close_px = float(self.base["close"].iat[i])
+            open_px  = float(self.base["open"].iat[i])
+            vol      = float(self.base["volume"].iat[i])
+            vsma     = float(self.tf["4H"]["vsma"].iat[i])
+            vprev    = float(self.tf["4H"]["prev_vol"].iat[i])
+            lo       = float(self.base["low"].iat[i]); hi = float(self.base["high"].iat[i])
+        else:
+            # must be exact TF close at t
+            if not bool(self.tf[tf]["closed"].iat[i]):
+                return (False, np.nan, np.nan, np.nan)
+            if t not in self.tf[tf]["df"].index:
+                return (False, np.nan, np.nan, np.nan)
+            row = self.tf[tf]["df"].loc[t]
+            close_px, open_px, lo, hi = float(row["close"]), float(row["open"]), float(row["low"]), float(row["high"])
+            vsma = float(self.tf[tf]["vsma"].iat[i])
+            # previous TF vol (aligned by TF index)
+            tf_idx = self.tf[tf]["df"].index.get_loc(t)
+            if tf_idx == 0:
+                return (False, np.nan, np.nan, np.nan)
+            vprev = float(self.tf[tf]["df"]["volume"].iloc[tf_idx-1])
+            vol   = float(row["volume"])
 
-    # Positions and trade log
-    open_entries: List[Dict] = []  # [{ "ts": ts, "px": price, "tf": tf }]
-    trades: List[Dict] = []        # closed trades on EXIT ALL
+        is_red = close_px < (open_px - self.p.tol)
+        hv_sma = vol > (vsma + self.p.tol) if not np.isnan(vsma) else False
+        hv_prev= vol > (vprev + self.p.tol) if not np.isnan(vprev) else False
+        valid  = is_red and hv_sma and hv_prev
+        return (valid, close_px, lo, hi)
 
-    closes = base["close"].values
-    idx = base.index
+    def _try_exit(self, i: int, t: pd.Timestamp):
+        if not self.open_entries:
+            return
+        close_px = float(self.base["close"].iat[i])
+        avg_entry = float(np.mean([e["px"] for e in self.open_entries]))
+        need_pts = self.p.target_per_entry * len(self.open_entries)
+        if (close_px - avg_entry) >= (need_pts - self.p.tol):
+            # EXIT ALL — emit per-entry trade rows
+            for e in self.open_entries:
+                self.trades.append({
+                    "side": "BUY",
+                    "tf": e["tf"],
+                    "entry_ts": e["ts"],
+                    "entry_px": e["px"],
+                    "exit_ts": t,
+                    "exit_px": close_px,
+                    "status": "tp",
+                    "pnl": close_px - float(e["px"]),
+                })
+            self.open_entries = []
+            self.ecr_low = self.ecr_high = None
 
-    for i, ts in enumerate(idx):
-        # Update windows at TF closes only
-        for tf in ("4H", "D", "W", "M"):
-            if tf_closed[tf].iat[i]:
-                reg_now = bool(ffields[tf]["reg_on"].iat[i])
-                if reg_now and not prev_reg[tf]:
-                    # OFF -> ON
-                    win_on[tf] = True
-                    ents[tf] = 0
-                elif (not reg_now) and prev_reg[tf]:
-                    # ON -> OFF
-                    win_on[tf] = False
-                prev_reg[tf] = reg_now
+    # ---- main run ----
+    def run(self) -> List[Dict]:
+        idx = self.base.index
+        for i, t in enumerate(idx):
+            # 1) windows update at TF closes
+            self._update_windows(t, i)
 
-        # Exit check: target-only on every 15m close
-        if open_entries:
-            avg_entry = float(np.mean([e["px"] for e in open_entries]))
-            need_pts = p.target_per_entry * len(open_entries)
-            unreal = float(closes[i] - avg_entry)
-            if unreal >= (need_pts - p.tol):
-                # EXIT ALL at 15m close
-                exit_px = float(closes[i])
-                for e in open_entries:
-                    trades.append({
-                        "side": "BUY",
-                        "entry_ts": e["ts"],
-                        "entry_px": e["px"],
-                        "exit_ts": ts,
-                        "exit_px": exit_px,
-                        "status": "tp",
-                        "reason": f"target_hit_{need_pts:.1f}",
-                        "tf": e["tf"],
-                        "pnl": exit_px - float(e["px"]),
-                    })
-                open_entries = []
-                ecr_low = ecr_high = None
-                # After exit, do not enter again on the same bar
+            # 2) target-only exit (4H close)
+            self._try_exit(i, t)
+
+            # 3) select active TF; require that TF bar CLOSED now (for HTFs)
+            active = self._active_tf(i)
+            if active is None:
+                continue
+            if active != "4H" and not bool(self.tf[active]["closed"].iat[i]):
+                continue
+            if not self.win_on.get(active, False):
+                continue
+            if self.ents[active] >= self.p.max_entries_per_window:
                 continue
 
-        # Choose active TF (highest priority)
-        active = _choose_active(bool(reg_ff["4H"].iat[i]),
-                                bool(reg_ff["D"].iat[i]),
-                                bool(reg_ff["W"].iat[i]),
-                                bool(reg_ff["M"].iat[i]))
-        # Entry only if an active TF exists and that TF bar has just CLOSED
-        if active is None or not tf_closed[active].iat[i]:
-            continue
+            # 4) validate BUY on active TF
+            ok, close_px, tf_low, tf_high = self._valid_buy_on(active, t, i)
+            if not ok:
+                continue
 
-        # Active TF OHLCV (forward-filled to this ts)
-        f = ffields[active]
-        act_open = float(f["open"].iat[i])
-        act_high = float(f["high"].iat[i])
-        act_low  = float(f["low"].iat[i])
-        act_close= float(f["close"].iat[i])
-        act_vol  = float(f["volume"].iat[i])
-        act_vsma = float(f["vsma"].iat[i]) if not np.isnan(f["vsma"].iat[i]) else np.nan
-        act_prev = float(f["prev_vol"].iat[i]) if not np.isnan(f["prev_vol"].iat[i]) else np.nan
+            # 5) ECR 10% re-entry gate
+            if (self.ecr_low is not None) and (self.ecr_high is not None):
+                R = max(0.0, self.ecr_high - self.ecr_low)
+                if R > self.p.tol:
+                    cur_low = float(self.base["low"].iat[i]); cur_high = float(self.base["high"].iat[i])
+                    ov = _overlap_len(self.ecr_low, self.ecr_high, cur_low, cur_high)
+                    if ov > (R * (self.p.ecr_overlap_pct / 100.0) + self.p.tol):
+                        continue
 
-        # Valid BUY candle: RED + High-Volume (Vol > SMA20 and > prev)
-        is_red = act_close < (act_open - p.tol)
-        hv_sma = (not np.isnan(act_vsma)) and (act_vol > (act_vsma + p.tol))
-        hv_prev = (not np.isnan(act_prev)) and (act_vol > (act_prev + p.tol))
-        valid = is_red and hv_sma and hv_prev
+            # 6) take entry @ base close price; set ECR from ACTIVE TF candle
+            self.open_entries.append({"ts": t, "px": close_px, "tf": active})
+            self.ents[active] += 1
+            self.ecr_low, self.ecr_high = float(tf_low), float(tf_high)
 
-        # Quotas & caps
-        if not win_on.get(active, False):
-            continue
-        if ents[active] >= 4:
-            continue
-        if len(open_entries) >= p.pyramiding_cap:
-            continue
+        # no forced exit at end (spec)
+        return self.trades
 
-        # ECR 10% overlap re-entry gate
-        ecr_ok = True
-        if ecr_low is not None and ecr_high is not None:
-            ecr_range = max(0.0, ecr_high - ecr_low)
-            if ecr_range > p.tol:
-                intr = _overlap_len(ecr_low, ecr_high, act_low, act_high)
-                ecr_ok = intr <= (ecr_range * (p.overlap_pct / 100.0) + p.tol)
-            else:
-                ecr_ok = True  # degenerate prior ECR; allow refresh
 
-        # Take entry at active TF close
-        if valid and ecr_ok:
-            open_entries.append({"ts": ts, "px": act_close, "tf": active})
-            ents[active] += 1
-            # Reset ECR from current entry candle
-            ecr_low = act_low
-            ecr_high = act_high
-
-    # Spec: no forced exit at end; open entries can remain open
-    return trades
-
+# ---------- public API ----------
+def generate_trades(df4h: pd.DataFrame, params: Dict | Params) -> List[Dict]:
+    p = Params(**params) if isinstance(params, dict) else params
+    eng = AutoShiftBuy(df4h, p)
+    return eng.run()
 
 def to_target_json(trades: List[Dict]) -> Dict:
     return {"version": 1, "trades": trades}
 
-
 def run_from_csv(csv_path: str, params: Dict | Params) -> Dict:
     df = pd.read_csv(csv_path)
+    # normalize expected columns to project format
+    if "ts" not in df.columns and "timestamp" in df.columns:
+        df = df.rename(columns={"timestamp":"ts"})
     trades = generate_trades(df, params)
     return to_target_json(trades)
 
@@ -233,8 +264,11 @@ def run_from_csv(csv_path: str, params: Dict | Params) -> Dict:
 if __name__ == "__main__":
     import sys, json
     if len(sys.argv) < 3:
-        print("Usage: python strategies/auto_shift_buy.py <csv_15m_path> '<params_json>'")
+        print("Usage: python strategies/auto_shift_buy.py <csv_4h_path> '<params_json>'")
         sys.exit(1)
     csv_path = sys.argv[1]
     params = json.loads(sys.argv[2])
-    print(json.dumps(run_from_csv(csv_path, params))[:2000])
+    out = run_from_csv(csv_path, params)
+    # preview
+    import json as _json
+    print(_json.dumps(out)[:2000])
